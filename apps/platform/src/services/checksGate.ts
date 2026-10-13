@@ -7,7 +7,8 @@
  * of a change's own edits, the head it publishes). With none registered the
  * required set is empty and its state is `success`, so a merge is gated by
  * mergeability alone. Producers return only checks that are required;
- * non-required and quarantined runs never reach the gate.
+ * non-required runs never reach the gate, and checks quarantined by name
+ * (services/flakes.ts) are answered apart, outside the required set.
  */
 
 export type CheckState = 'success' | 'pending' | 'failure';
@@ -27,6 +28,11 @@ export interface RequiredCheck {
   incomplete?: true;
   /** With `incomplete`: how many changed paths went uninspected (a truncated change list adds an unknown number). */
   uninspected?: number;
+  /**
+   * The check is quarantined (services/flakes.ts): the gate lists it under
+   * `quarantined`, never in `required`, so it neither satisfies nor blocks.
+   */
+  quarantined?: true;
 }
 
 export interface RequiredChecks {
@@ -35,6 +41,12 @@ export interface RequiredChecks {
   required: RequiredCheck[];
   /** `failure` if any required check failed, else `pending` if any is unfinished, else `success`. */
   state: CheckState;
+  /**
+   * Quarantined checks with their current state, outside `required` and
+   * `state`. Only branch rules that name one still consult it (fail-closed).
+   * Absent when there are none.
+   */
+  quarantined?: RequiredCheck[];
 }
 
 export interface ChecksRepo {
@@ -80,8 +92,10 @@ export function checksGate(producers: readonly ChecksProducer[]): ChecksGate {
       const lists = await Promise.all(
         producers.map(async (p) => (await p.requiredChecksFor(repo, treeSha, configId, subject)).map((c) => ({ ...c, producer: p.name }))),
       );
-      const required = lists.flat();
-      return { treeSha, configId, required, state: rollupState(required) };
+      const all = lists.flat();
+      const required = all.filter((c) => !c.quarantined);
+      const quarantined = all.filter((c) => c.quarantined);
+      return { treeSha, configId, required, state: rollupState(required), ...(quarantined.length > 0 ? { quarantined } : {}) };
     },
   };
 }

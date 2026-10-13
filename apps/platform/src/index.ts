@@ -18,6 +18,7 @@ import { dependenciesApi } from './routes/api/dependencies';
 import { attributionApi } from './routes/api/attribution';
 import { checksApi } from './routes/api/checks';
 import { ciApi } from './routes/api/ci';
+import { flakesApi } from './routes/api/flakes';
 import { containerRunnerApi } from './routes/api/containerRunner';
 import { handleEventBatch } from './services/events';
 import { handleMcp } from './mcp/server';
@@ -76,6 +77,7 @@ app.route('/api/v1', candidatesApi);
 app.route('/api/v1', attributionApi);
 app.route('/api/v1', checksApi);
 app.route('/api/v1', ciApi);
+app.route('/api/v1', flakesApi);
 app.route('/api/v1', containerRunnerApi);
 // MCP tool calls are dispatched back through this router to their REST routes.
 app.all('/mcp', (c) => handleMcp(c.req.raw, c.env, async (req) => app.fetch(req, c.env, c.executionCtx)));

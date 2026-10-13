@@ -42,5 +42,5 @@ ciApi.post('/repos/:owner/:repo/ci/jobs/:id/report', async (c) => {
   if (r.value.change) {
     c.executionCtx.waitUntil(resumeAfterCheck(c.env, x.d.repo.id, r.value.change, (p) => c.executionCtx.waitUntil(p)));
   }
-  return actorJson(c, { run: r.value.run, change: r.value.change ? { number: r.value.change.number } : null });
+  return actorJson(c, { run: r.value.run, change: r.value.change ? { number: r.value.change.number } : null, retry: r.value.retry, flake: r.value.flake });
 });

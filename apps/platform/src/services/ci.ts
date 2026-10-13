@@ -9,6 +9,7 @@ import type { ServiceResult } from '../repos/service';
 import { withLazyRepo } from '../artifacts/repo';
 import { CHECK_RUN_COLUMNS, checkRunView, type CheckRunRow, type CheckRunView } from './checks';
 import { CI_CONFIG_PATH, CI_LIMITS, parseCiConfig, type CiConfig } from './ciConfig';
+import { quarantinedSql, retryOutcome, retryStatements, type RetryOutcome } from './flakes';
 
 export const CI_LEASE_SECONDS = 120;
 export { CI_CONFIG_PATH, CI_LIMITS, type CiConfig } from './ciConfig';
@@ -279,6 +280,9 @@ export async function heartbeatJob(env: Env, repo: RepoRow, id: string, input: u
   return fail(exists ? 409 : 404, exists ? 'the CI job claim is stale' : 'CI job not found', exists ? 'STALE_GENERATION' : 'CI_JOB_NOT_FOUND');
 }
 
+/** A quarantined check is neutral in a composition's recorded checks, as in the gate. */
+const QUARANTINED_X = quarantinedSql('x.repo_id', 'x.name', '?3');
+
 interface ReportBody extends FenceInput {
   conclusion: 'success' | 'failure';
   summary: string;
@@ -294,18 +298,23 @@ function parseReport(input: unknown): ServiceResult<ReportBody> {
   return { ok: true, value: { ...fence.value, conclusion: b.conclusion, summary } };
 }
 
-export interface ReportedJob {
+export interface ReportedJob extends RetryOutcome {
   run: CheckRunView;
   change: { number: number; policy: string; baseRef: string; queued: boolean } | null;
   treeSha: string;
 }
 
-/** Terminal update + check run + readback, atomically fenced by generation and owner. */
+/**
+ * Terminal update + check run + readback, atomically fenced by generation
+ * and owner. A required attempt-1 failure schedules its one retry and an
+ * attempt-2 pass records a flake in the same batch (services/flakes.ts).
+ */
 export async function reportJob(env: Env, repo: RepoRow, id: string, input: unknown): Promise<ServiceResult<ReportedJob>> {
   const p = parseReport(input);
   if (!p.ok) return p;
   const now = Date.now();
-  const [job, runRead, changeRead] = await env.DB.batch([
+  const retry = retryStatements(env.DB, { jobId: id, repoId: repo.id, generation: p.value.generation, runnerId: p.value.runnerId, now });
+  const [job, runRead, changeRead, , , , retryRead] = await env.DB.batch([
     env.DB.prepare(
       `UPDATE ci_jobs SET status = ?5, summary = ?6, finished_at = ?7, lease_until = NULL
        WHERE id = ?1 AND repo_id = ?2 AND generation = ?3 AND claimed_by = ?4 AND status = 'running' AND lease_until > ?7
@@ -322,6 +331,7 @@ export async function reportJob(env: Env, repo: RepoRow, id: string, input: unkn
               EXISTS (SELECT 1 FROM merge_queue q WHERE q.change_set_id = c.id AND q.active = 1) AS queued
          FROM change_sets c WHERE c.id = (SELECT change_set_id FROM ci_jobs WHERE id = ?1 AND repo_id = ?2)`,
     ).bind(id, repo.id),
+    ...retry.statements,
     env.DB.prepare(
       `UPDATE compositions
           SET checks = json_object(
@@ -335,7 +345,7 @@ export async function reportJob(env: Env, repo: RepoRow, id: string, input: unkn
                     'runId', x.id
                   ))
                   FROM check_runs x
-                  WHERE x.repo_id = ?2 AND x.tree_sha = compositions.tree_sha AND x.required = 1 AND x.quarantined = 0
+                  WHERE x.repo_id = ?2 AND x.tree_sha = compositions.tree_sha AND x.required = 1 AND x.quarantined = 0 AND NOT ${QUARANTINED_X}
                     AND NOT EXISTS (
                       SELECT 1 FROM check_runs newer
                        WHERE newer.repo_id = x.repo_id AND newer.tree_sha = x.tree_sha AND newer.name = x.name
@@ -345,7 +355,7 @@ export async function reportJob(env: Env, repo: RepoRow, id: string, input: unkn
                 'state', CASE
                   WHEN EXISTS (
                     SELECT 1 FROM check_runs x
-                     WHERE x.repo_id = ?2 AND x.tree_sha = compositions.tree_sha AND x.required = 1 AND x.quarantined = 0 AND x.status = 'failure'
+                     WHERE x.repo_id = ?2 AND x.tree_sha = compositions.tree_sha AND x.required = 1 AND x.quarantined = 0 AND NOT ${QUARANTINED_X} AND x.status = 'failure'
                        AND NOT EXISTS (SELECT 1 FROM check_runs newer
                          WHERE newer.repo_id = x.repo_id AND newer.tree_sha = x.tree_sha AND newer.name = x.name
                            AND (newer.created_at > x.created_at OR (newer.created_at = x.created_at AND newer.id > x.id)))
@@ -353,7 +363,7 @@ export async function reportJob(env: Env, repo: RepoRow, id: string, input: unkn
                     THEN 'failure'
                   WHEN EXISTS (
                     SELECT 1 FROM check_runs x
-                     WHERE x.repo_id = ?2 AND x.tree_sha = compositions.tree_sha AND x.required = 1 AND x.quarantined = 0 AND x.status IN ('queued','running')
+                     WHERE x.repo_id = ?2 AND x.tree_sha = compositions.tree_sha AND x.required = 1 AND x.quarantined = 0 AND NOT ${QUARANTINED_X} AND x.status IN ('queued','running')
                        AND NOT EXISTS (SELECT 1 FROM check_runs newer
                          WHERE newer.repo_id = x.repo_id AND newer.tree_sha = x.tree_sha AND newer.name = x.name
                            AND (newer.created_at > x.created_at OR (newer.created_at = x.created_at AND newer.id > x.id)))
@@ -365,7 +375,7 @@ export async function reportJob(env: Env, repo: RepoRow, id: string, input: unkn
               conflict_kind = CASE
                 WHEN EXISTS (
                   SELECT 1 FROM check_runs x
-                   WHERE x.repo_id = ?2 AND x.tree_sha = compositions.tree_sha AND x.required = 1 AND x.quarantined = 0 AND x.status = 'failure'
+                   WHERE x.repo_id = ?2 AND x.tree_sha = compositions.tree_sha AND x.required = 1 AND x.quarantined = 0 AND NOT ${QUARANTINED_X} AND x.status = 'failure'
                      AND NOT EXISTS (SELECT 1 FROM check_runs newer
                        WHERE newer.repo_id = x.repo_id AND newer.tree_sha = x.tree_sha AND newer.name = x.name
                          AND (newer.created_at > x.created_at OR (newer.created_at = x.created_at AND newer.id > x.id)))
@@ -374,7 +384,7 @@ export async function reportJob(env: Env, repo: RepoRow, id: string, input: unkn
                 ELSE NULL
               END
         WHERE repo_id = ?2 AND tree_sha = (SELECT tree_sha FROM ci_jobs WHERE id = ?1 AND repo_id = ?2)`,
-    ).bind(id, repo.id),
+    ).bind(id, repo.id, now),
   ]);
   const moved = (job?.results as Array<{ tree_sha: string; check_run_id: string }> | undefined)?.[0];
   const run = (runRead?.results as CheckRunRow[] | undefined)?.[0];
@@ -389,6 +399,7 @@ export async function reportJob(env: Env, repo: RepoRow, id: string, input: unkn
       run: checkRunView(run),
       treeSha: moved.tree_sha,
       change: c ? { number: c.number, policy: c.merge_policy, baseRef: c.base_ref, queued: c.queued === 1 } : null,
+      ...retryOutcome((retryRead?.results as Array<{ retry_run_id: string | null; flake_id: string | null }> | undefined)?.[0]),
     },
   };
 }

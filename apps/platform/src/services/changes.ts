@@ -91,6 +91,7 @@ import {
 import type { ChangeRating } from './risk';
 import { kickTrain } from './trainKick';
 import { ciCleanupStatement, hasCiJobs, queueChangeCi, queueExactTreeCi } from './ci';
+import { activeQuarantinesStatement, flakeCleanupStatements, markQuarantined, quarantineNames } from './flakes';
 
 export const MERGE_POLICIES = ['auto', 'draft', 'review'] as const;
 export type MergePolicy = (typeof MERGE_POLICIES)[number];
@@ -374,9 +375,12 @@ export async function readChange(env: Env, repoId: string, number: number): Prom
   return changeSelect(env.DB, repoId, number).first<ChangeRow>();
 }
 
-/** One batch: the change and its newest check runs (bounded), so the cost is the same for any number of runs. */
+/**
+ * One batch: the change, its newest check runs (bounded) and the active
+ * quarantines, so the cost is the same for any number of runs.
+ */
 async function readChangeWithChecks(env: Env, repoId: string, number: number): Promise<{ row: ChangeRow; checks: CheckRunView[] } | null> {
-  const [change, checks] = await env.DB.batch([
+  const [change, checks, quarantines] = await env.DB.batch([
     changeSelect(env.DB, repoId, number),
     env.DB.prepare(
       `SELECT ${CHECK_RUN_COLUMNS}
@@ -385,10 +389,12 @@ async function readChangeWithChecks(env: Env, repoId: string, number: number): P
         ORDER BY k.created_at DESC, k.id DESC
         LIMIT ${CHANGE_LIMITS.checksMax}`,
     ).bind(repoId, number),
+    activeQuarantinesStatement(env.DB, repoId, Date.now()),
   ]);
   const row = (change?.results as ChangeRow[] | undefined)?.[0];
   if (!row) return null;
-  return { row, checks: ((checks?.results as CheckRunRow[] | undefined) ?? []).map(checkRunView) };
+  const names = quarantineNames(quarantines?.results as Array<{ name: string }> | undefined);
+  return { row, checks: markQuarantined(((checks?.results as CheckRunRow[] | undefined) ?? []).map(checkRunView), names) };
 }
 
 export interface ChangePage {
@@ -963,8 +969,10 @@ export function memoGate(inner: ChecksGate): ChecksGate {
  * (services/reviewGate.ts).
  */
 export function branchPolicyBlock(policy: BranchPolicy, checks: RequiredChecks): Fail | null {
+  // A rule that names a quarantined check still requires it: quarantine never overrides an explicit rule (§0.3).
+  const named = (name: string) => checks.required.find((c) => c.name === name) ?? checks.quarantined?.find((c) => c.name === name);
   for (const name of policy.requiredChecks) {
-    if (checks.required.find((c) => c.name === name)?.state === 'failure') {
+    if (named(name)?.state === 'failure') {
       return fail(409, `required check ${name} failed`, 'REQUIRED_CHECKS_FAILED', { checks });
     }
   }
@@ -987,7 +995,7 @@ export function branchPolicyBlock(policy: BranchPolicy, checks: RequiredChecks):
     }
   }
   for (const name of policy.requiredChecks) {
-    if (checks.required.find((c) => c.name === name)?.state !== 'success') {
+    if (named(name)?.state !== 'success') {
       return fail(409, `required check ${name} has not passed on the merge result`, 'REQUIRED_CHECKS_PENDING', { checks });
     }
   }
@@ -1694,6 +1702,7 @@ export function changeCleanupStatements(db: D1Database, repoId: string): D1Prepa
     db.prepare('DELETE FROM comments WHERE change_set_id IN (SELECT id FROM change_sets WHERE repo_id = ?)').bind(repoId),
     ciCleanupStatement(db, repoId),
     db.prepare('DELETE FROM check_runs WHERE repo_id = ?').bind(repoId),
+    ...flakeCleanupStatements(db, repoId),
     db.prepare('UPDATE workspaces SET change_set_id = NULL WHERE repo_id = ?').bind(repoId),
     db.prepare('DELETE FROM merge_queue WHERE repo_id = ?').bind(repoId),
     db.prepare('DELETE FROM merge_trains WHERE repo_id = ?').bind(repoId),

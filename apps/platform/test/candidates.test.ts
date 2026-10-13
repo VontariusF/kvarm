@@ -747,15 +747,23 @@ describe('composition', () => {
       state: 'pending',
       producer: 'check-runs',
     });
-    const claim = await call('POST', `${R('compose-ci')}/ci/jobs/claim`, tok.owner, { runnerId: 'compose-runner' });
-    expect(claim.json.job).toMatchObject({ name: 'semantic', sha: composed.json.commitSha, treeSha: composed.json.treeSha });
-    const report = await call('POST', `${R('compose-ci')}/ci/jobs/${claim.json.job.id}/report`, tok.owner, {
-      runnerId: 'compose-runner',
-      generation: claim.json.job.generation,
-      conclusion: 'failure',
-      summary: { exitCode: 1 },
-    });
-    expect(report.status).toBe(200);
+    // A required failure is retried once on the same composed tree; failing again makes it a semantic conflict.
+    for (const attempt of [1, 2]) {
+      const claim = await call('POST', `${R('compose-ci')}/ci/jobs/claim`, tok.owner, { runnerId: 'compose-runner' });
+      expect(claim.json.job).toMatchObject({ name: 'semantic', sha: composed.json.commitSha, treeSha: composed.json.treeSha });
+      const report = await call('POST', `${R('compose-ci')}/ci/jobs/${claim.json.job.id}/report`, tok.owner, {
+        runnerId: 'compose-runner',
+        generation: claim.json.job.generation,
+        conclusion: 'failure',
+        summary: { exitCode: 1 },
+      });
+      expect(report.status).toBe(200);
+      expect(report.json.run.attempt).toBe(attempt);
+      if (attempt === 1) {
+        expect(report.json.retry).not.toBeNull();
+        expect((await call('GET', `${R('compose-ci')}/compositions/${composed.json.id}`, tok.owner)).json.conflict).toBeNull();
+      }
+    }
 
     const read = await call('GET', `${R('compose-ci')}/compositions/${composed.json.id}`, tok.owner);
     expect(read.json.conflict).toEqual({ kind: 'semantic', checks: ['semantic'], treeSha: composed.json.treeSha });

@@ -18,6 +18,7 @@ import type { RepoRow } from '../db/repos';
 import type { ServiceResult } from '../repos/service';
 import { CHECKS_PRODUCERS, rollupState, type CheckState, type ChecksProducer, type ChecksSubject, type RequiredCheck } from './checksGate';
 import { treePairBody, type CompareBody } from './compare';
+import { activeQuarantinesStatement, markQuarantined, quarantineNames } from './flakes';
 import { runPool } from './pool';
 import { resolveCommitish, type ResolveContext } from './refs';
 
@@ -365,11 +366,17 @@ function answer(
   guardRows: readonly GateRow[],
   subject: ChecksSubject | null,
   treeWindowFull: boolean,
+  quarantined: ReadonlySet<string>,
 ): Array<Omit<RequiredCheck, 'producer'>> {
   const newest = new Map<string, GateRow>();
   // Rows arrive newest first: the first row per name is its current run.
   for (const r of treeRows) if (r.name !== GUARD_CHECK && !newest.has(r.name)) newest.set(r.name, r);
-  const out: Array<Omit<RequiredCheck, 'producer'>> = [...newest.values()].map((r) => ({ name: r.name, state: stateOf(r.status), runId: r.id }));
+  const out: Array<Omit<RequiredCheck, 'producer'>> = [...newest.values()].map((r) => ({
+    name: r.name,
+    state: stateOf(r.status),
+    runId: r.id,
+    ...(quarantined.has(r.name) ? { quarantined: true as const } : {}),
+  }));
   const guard = subject ? guardRows[0] : undefined;
   out.push(guard ? guardAnswer(guard, subject!.guardBaseTree) : { name: GUARD_CHECK, state: 'pending' });
   if (treeWindowFull) out.push({ name: CHECKS_WINDOW_CHECK, state: 'pending' });
@@ -406,12 +413,15 @@ export function checkRunsProducer(env: Pick<Env, 'DB'>): ChecksProducer {
                 ORDER BY k.created_at DESC, k.id DESC LIMIT 1`,
             ).bind(repoId, k.value, k.changeId),
       );
+      // Quarantine is read with the runs, so one answer never mixes two quarantine states (services/flakes.ts).
+      statements.push(activeQuarantinesStatement(env.DB, repoId, Date.now()));
       const results = await env.DB.batch<GateRow>(statements);
+      const quarantined = quarantineNames(results[keys.length]?.results);
       const rows = new Map(keys.map((k, i) => [`${k.kind}:${k.kind === 'guard' ? `${k.changeId}:` : ''}${k.value}`, results[i]?.results ?? []]));
       for (const p of batch) {
         const treeRows = rows.get(`tree:${p.treeSha}`) ?? [];
         const guardRows = p.subject ? (rows.get(`guard:${p.subject.changeId}:${p.subject.headSha}`) ?? []) : [];
-        p.resolve(answer(treeRows, guardRows, p.subject, treeRows.length === CHECK_LIMITS.gateRowsPerTree));
+        p.resolve(answer(treeRows, guardRows, p.subject, treeRows.length === CHECK_LIMITS.gateRowsPerTree, quarantined));
       }
     } catch (err) {
       for (const p of batch) p.reject(err);
@@ -460,22 +470,27 @@ export interface CommitStatus {
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 
-/** GET commits/:sha/status — one bounded indexed query; the newest run per check name. */
+/**
+ * GET commits/:sha/status — one batch: the bounded indexed newest runs per
+ * check name and the active quarantines (a quarantined check is neutral).
+ */
 export async function commitStatus(env: Env, repo: RepoRow, sha: string): Promise<ServiceResult<CommitStatus>> {
   if (!SHA_RE.test(sha)) return { ok: false, status: 422, error: 'sha must be a full 40-character commit id', code: 'INVALID_SHA' };
-  const { results } = await env.DB.prepare(
-    `SELECT ${CHECK_RUN_COLUMNS} FROM check_runs k WHERE k.repo_id = ?1 AND k.head_sha = ?2
-      ORDER BY k.created_at DESC, k.id DESC LIMIT ${CHECK_LIMITS.statusMax}`,
-  )
-    .bind(repo.id, sha)
-    .all<CheckRunRow>();
+  const [runs, quarantines] = await env.DB.batch([
+    env.DB.prepare(
+      `SELECT ${CHECK_RUN_COLUMNS} FROM check_runs k WHERE k.repo_id = ?1 AND k.head_sha = ?2
+        ORDER BY k.created_at DESC, k.id DESC LIMIT ${CHECK_LIMITS.statusMax}`,
+    ).bind(repo.id, sha),
+    activeQuarantinesStatement(env.DB, repo.id, Date.now()),
+  ]);
   const seen = new Set<string>();
-  const checks: CheckRunView[] = [];
-  for (const r of results ?? []) {
+  let checks: CheckRunView[] = [];
+  for (const r of (runs?.results ?? []) as CheckRunRow[]) {
     if (seen.has(r.name)) continue;
     seen.add(r.name);
     checks.push(checkRunView(r));
   }
+  checks = markQuarantined(checks, quarantineNames(quarantines?.results as Array<{ name: string }> | undefined));
   const counted = checks.filter((c) => c.required && !c.quarantined).map((c) => ({ state: stateOf(c.status) }));
   const incomplete = checks.filter((c) => c.name === GUARD_CHECK && guardIncompleteness(c.summary)).map((c) => c.name);
   return { ok: true, value: { sha, state: checks.length === 0 ? 'none' : rollupState(counted), total: checks.length, checks, incomplete } };
@@ -617,6 +632,7 @@ export async function updateCheckRun(env: Env, repo: RepoRow, id: string, input:
           finished_at = CASE WHEN ?7 = 1 THEN ?6 ELSE NULL END
        WHERE id = ?1 AND repo_id = ?2 AND name NOT LIKE 'kvarm/%'
          AND NOT EXISTS (SELECT 1 FROM ci_jobs j WHERE j.check_run_id = check_runs.id)
+         AND NOT EXISTS (SELECT 1 FROM check_runs r WHERE r.retry_of = check_runs.id)
        RETURNING ${CHECK_RUN_COLUMNS.replaceAll('k.', '')}`,
     ).bind(id, repo.id, status, conclusion ?? (terminal ? status : null), summary === undefined ? null : summary, now, terminal ? 1 : 0),
     env.DB.prepare(
@@ -625,7 +641,8 @@ export async function updateCheckRun(env: Env, repo: RepoRow, id: string, input:
          FROM change_sets c WHERE c.id = (SELECT change_set_id FROM check_runs WHERE id = ?1 AND repo_id = ?2)`,
     ).bind(id, repo.id),
     env.DB.prepare(
-      `SELECT name, EXISTS (SELECT 1 FROM ci_jobs j WHERE j.check_run_id = k.id) AS runner_owned
+      `SELECT name, EXISTS (SELECT 1 FROM ci_jobs j WHERE j.check_run_id = k.id)
+                    OR EXISTS (SELECT 1 FROM check_runs r WHERE r.retry_of = k.id) AS runner_owned
          FROM check_runs k WHERE k.id = ?1 AND k.repo_id = ?2`,
     ).bind(id, repo.id),
   ]);
