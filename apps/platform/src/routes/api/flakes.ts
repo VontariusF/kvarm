@@ -33,7 +33,16 @@ flakesApi.post('/repos/:owner/:repo/flakes/:check/quarantine', async (c) => {
   const d = await authorizeRoute(c, 'admin', { requireActor: true });
   if (!d.ok) return denyJson(c, d);
   if (!d.actor) return c.json({ error: 'unauthorized' }, 401);
-  const body: unknown = await c.req.json().catch(() => ({}));
+  // No body means the defaults; a body that is not JSON is refused rather than read as the defaults.
+  const text = await c.req.text();
+  let body: unknown = {};
+  if (text.trim() !== '') {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      return c.json({ error: 'body must be a JSON object', code: 'INVALID_BODY' }, 400);
+    }
+  }
   const r = await flakes.quarantineCheck(c.env, d.repo, d.actor, c.req.param('check'), body);
   if (!r.ok) return failJson(c, r);
   return actorJson(c, { quarantine: r.value });

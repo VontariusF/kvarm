@@ -7,7 +7,7 @@
  */
 
 import { env as cfEnv } from 'cloudflare:workers';
-import { createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
+import { createExecutionContext, createMessageBatch, getQueueResult, waitOnExecutionContext } from 'cloudflare:test';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { mintPAT, type Scope } from '../src/auth/pat';
 import { COST_HEADER, parseCostHeader, type CostCounters } from '../src/cost/meter';
@@ -116,6 +116,21 @@ const mergeability = (repo: string, n = 1) => call('GET', `${R(repo)}/changes/${
 const merge = (repo: string, n = 1) => call('POST', `${R(repo)}/changes/${n}/merge`, tok.owner);
 const status = (repo: string, sha: string) => call('GET', `${R(repo)}/commits/${sha}/status`, tok.owner);
 
+async function deliverPush(repo: string, ref: string, before: string, after: string) {
+  const body = {
+    type: 'cf.artifacts.repo.pushed',
+    source: { type: 'artifacts', namespace: 'default', repoName: `${OWNER}--${repo}` },
+    payload: { ref, before, after, commits: [], totalCommitsCount: 0, commitsTruncated: false },
+    metadata: { accountId: 'acct', eventSubscriptionId: 'sub', eventSchemaVersion: 1, eventTimestamp: new Date(Date.now() + 1_000).toISOString() },
+  };
+  const batch = createMessageBatch('kvarm-events', [{ id: crypto.randomUUID(), timestamp: new Date(), attempts: 1, body }]);
+  const ctx = createExecutionContext();
+  await worker.queue!(batch, env, ctx);
+  const result = await getQueueResult(batch, ctx);
+  await waitOnExecutionContext(ctx);
+  expect(result.explicitAcks).toHaveLength(1);
+}
+
 async function count(sql: string, ...binds: unknown[]): Promise<number> {
   return (await env.DB.prepare(sql).bind(...binds).first<number>('n')) ?? 0;
 }
@@ -174,6 +189,8 @@ describe('retry-then-classify', () => {
     expect(failed.cost.d1).toBeLessThanOrEqual(2);
     expect(await jobsOf('retry-pass')).toBe(1);
     expect(await runsNamed('retry-pass', 'test')).toBe(2);
+    // The requeued job carries no stale attempt-1 summary; that stays on the attempt-1 run.
+    expect(await env.DB.prepare('SELECT status, summary FROM ci_jobs WHERE id = ?').bind(first.json.job.id).first()).toEqual({ status: 'queued', summary: null });
 
     // A runner that reports twice cannot schedule a second retry: the job already left `running`.
     const duplicate = await reportJob('retry-pass', first.json.job, 'failure', 'runner-a');
@@ -284,6 +301,39 @@ describe('retry-then-classify', () => {
   });
 });
 
+describe('retry eligibility', () => {
+  it('does not retry the job of a closed change or a head that moved on', async () => {
+    const config = ci([{ name: 'test', run: 'npm test', required: true }]);
+    await ciChange('retry-closed', config);
+    const job = await claim('retry-closed');
+    expect((await call('PATCH', `${R('retry-closed')}/changes/1`, tok.owner, { state: 'closed' })).status).toBe(200);
+    expect((await reportJob('retry-closed', job.json.job, 'failure')).json.retry).toBeNull();
+    expect((await claim('retry-closed')).status).toBe(204);
+
+    const { repo, feature } = await ciChange('retry-moved', config);
+    const old = await claim('retry-moved');
+    const next = await commit(repo, { ...BASE, '.kvarm/ci.json': config, 'moved.txt': 'moved\n' }, [feature.sha]);
+    repo.refs.set(FEATURE, next.sha);
+    await deliverPush('retry-moved', FEATURE, feature.sha, next.sha);
+    expect((await reportJob('retry-moved', old.json.job, 'failure')).json.retry).toBeNull();
+    // Only the new head's job is left to claim.
+    const fresh = await claim('retry-moved');
+    expect(fresh.json.job.sha).toBe(next.sha);
+    expect((await reportJob('retry-moved', fresh.json.job, 'failure')).json.retry).not.toBeNull();
+  });
+
+  it('retries a quarantined check that a branch rule names, since the rule still requires it', async () => {
+    await ciChange('retry-ruled', ci([{ name: 'test', run: 'npm test', required: true }]), [{ pattern: 'main', requiredChecks: ['test'] }]);
+    expect((await quarantine('retry-ruled', 'test')).status).toBe(200);
+    const first = await claim('retry-ruled');
+    expect((await reportJob('retry-ruled', first.json.job, 'failure')).json.retry).not.toBeNull();
+    const second = await claim('retry-ruled');
+    expect((await reportJob('retry-ruled', second.json.job, 'success')).json.flake).not.toBeNull();
+    const merged = await merge('retry-ruled');
+    expect(merged.status, JSON.stringify(merged.json)).toBe(200);
+  });
+});
+
 describe('quarantine and restore', () => {
   it('admins quarantine and restore with audit rows; others are refused by the shared policy', async () => {
     await seedRepo('q-authz');
@@ -299,6 +349,23 @@ describe('quarantine and restore', () => {
     expect((await quarantine('q-authz', 'test', { expiresAt: new Date(Date.now() - 1000).toISOString() })).json.code).toBe('INVALID_EXPIRY');
     expect((await quarantine('q-authz', 'test', { expiresAt: new Date(Date.now() + 91 * 86_400_000).toISOString() })).json.code).toBe('INVALID_EXPIRY');
     expect((await quarantine('q-authz', 'test', { reason: 'x'.repeat(501) })).json.code).toBe('INVALID_REASON');
+    expect((await quarantine('q-authz', 'test', [])).json.code).toBe('INVALID_BODY');
+    const malformed = await (async () => {
+      const ctx = createExecutionContext();
+      const res = await worker.fetch!(
+        new Request(`${ORIGIN}${R('q-authz')}/flakes/test/quarantine`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${tok.owner}`, 'content-type': 'application/json' },
+          body: '{"expiresAt": "2030-01-01T00:00:00Z"',
+        }) as Request<unknown, IncomingRequestCfProperties>,
+        env,
+        ctx,
+      );
+      await waitOnExecutionContext(ctx);
+      return { status: res.status, json: (await res.json()) as Record<string, unknown> };
+    })();
+    expect([malformed.status, malformed.json.code]).toEqual([400, 'INVALID_BODY']);
+    expect((await flakesOf('q-authz')).json.quarantines).toEqual([]);
 
     const before = Date.now();
     const q = await quarantine('q-authz', 'unit/js', { reason: 'times out on shared runners' });

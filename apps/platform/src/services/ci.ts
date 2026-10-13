@@ -314,7 +314,7 @@ export async function reportJob(env: Env, repo: RepoRow, id: string, input: unkn
   if (!p.ok) return p;
   const now = Date.now();
   const retry = retryStatements(env.DB, { jobId: id, repoId: repo.id, generation: p.value.generation, runnerId: p.value.runnerId, now });
-  const [job, runRead, changeRead, , , , retryRead] = await env.DB.batch([
+  const results = await env.DB.batch([
     env.DB.prepare(
       `UPDATE ci_jobs SET status = ?5, summary = ?6, finished_at = ?7, lease_until = NULL
        WHERE id = ?1 AND repo_id = ?2 AND generation = ?3 AND claimed_by = ?4 AND status = 'running' AND lease_until > ?7
@@ -331,7 +331,7 @@ export async function reportJob(env: Env, repo: RepoRow, id: string, input: unkn
               EXISTS (SELECT 1 FROM merge_queue q WHERE q.change_set_id = c.id AND q.active = 1) AS queued
          FROM change_sets c WHERE c.id = (SELECT change_set_id FROM ci_jobs WHERE id = ?1 AND repo_id = ?2)`,
     ).bind(id, repo.id),
-    ...retry.statements,
+    ...retry,
     env.DB.prepare(
       `UPDATE compositions
           SET checks = json_object(
@@ -386,6 +386,9 @@ export async function reportJob(env: Env, repo: RepoRow, id: string, input: unkn
         WHERE repo_id = ?2 AND tree_sha = (SELECT tree_sha FROM ci_jobs WHERE id = ?1 AND repo_id = ?2)`,
     ).bind(id, repo.id, now),
   ]);
+  const [job, runRead, changeRead] = results;
+  // retryStatements reads back last; it follows the three statements above.
+  const retryRead = results[3 + retry.length - 1];
   const moved = (job?.results as Array<{ tree_sha: string; check_run_id: string }> | undefined)?.[0];
   const run = (runRead?.results as CheckRunRow[] | undefined)?.[0];
   if (!moved || !run) {

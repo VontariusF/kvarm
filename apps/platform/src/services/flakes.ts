@@ -9,8 +9,10 @@
  * of its name on the tree it is what the gate reads. A pass on attempt 2
  * records a flake and the check counts as passed; a second failure blocks
  * like any failure and is never retried again. Platform checks
- * (`kvarm/*`), reported runs, non-required jobs and quarantined checks are
- * never retried.
+ * (`kvarm/*`), reported runs, non-required jobs, jobs of a change that is
+ * no longer open or that has a newer job of the same name (a moved head or
+ * a re-prepared composition), and quarantined checks no branch rule names
+ * are never retried.
  *
  * Quarantine is per check name and always expires (default 7 days, at most
  * 90). A quarantined check still runs, but its runs are neutral: the gate
@@ -92,14 +94,16 @@ export interface RetryInput {
  * report, which makes no transition, retries nothing and records nothing.
  * The last statement reads back what happened.
  */
-export function retryStatements(db: D1Database, r: RetryInput): { statements: D1PreparedStatement[]; retryRunId: string; flakeId: string } {
+export function retryStatements(db: D1Database, r: RetryInput): D1PreparedStatement[] {
   const retryRunId = crypto.randomUUID();
   const flakeId = crypto.randomUUID();
   const transitioned = (status: 'failure' | 'success') =>
     `j.id = ?1 AND j.repo_id = ?2 AND j.generation = ?3 AND j.claimed_by = ?4 AND j.status = '${status}' AND j.finished_at = ?5`;
-  const statements = [
-    // Attempt 2: only for a required, unquarantined attempt-1 runner run. Created after attempt 1 so it is the
-    // newest run of the name on the tree, which is what the gate and the commit status read.
+  return [
+    // Attempt 2: only for a required attempt-1 runner run of a live change whose job is still the newest of its
+    // name there. A quarantined check is retried only while a branch rule names it, since such a rule still
+    // requires it (fail-closed). Created after attempt 1 so it is the newest run of the name on the tree, which
+    // is what the gate and the commit status read.
     db
       .prepare(
         `INSERT INTO check_runs (id, repo_id, change_set_id, head_sha, tree_sha, name, status, attempt, required, quarantined, retry_of, created_at)
@@ -107,16 +111,21 @@ export function retryStatements(db: D1Database, r: RetryInput): { statements: D1
            FROM ci_jobs j JOIN check_runs k ON k.id = j.check_run_id
           WHERE ${transitioned('failure')}
             AND j.required = 1 AND k.required = 1 AND k.quarantined = 0 AND k.attempt = 1 AND k.retry_of IS NULL
-            AND k.name NOT LIKE 'kvarm/%' AND NOT ${quarantinedSql('j.repo_id', 'k.name', '?5')}
+            AND k.name NOT LIKE 'kvarm/%'
+            AND EXISTS (SELECT 1 FROM change_sets c WHERE c.id = j.change_set_id AND c.state IN ('open', 'conflicted'))
+            AND NOT EXISTS (SELECT 1 FROM ci_jobs n WHERE n.change_set_id = j.change_set_id AND n.name = j.name AND n.created_at > j.created_at)
+            AND (NOT ${quarantinedSql('j.repo_id', 'k.name', '?5')}
+                 OR EXISTS (SELECT 1 FROM branch_rules b, json_each(b.required_checks) rc WHERE b.repo_id = j.repo_id AND rc.value = k.name))
          ON CONFLICT DO NOTHING`,
       )
       .bind(r.jobId, r.repoId, r.generation, r.runnerId, r.now, retryRunId),
     // The same job row runs attempt 2: requeued under its current generation, which the next claim bumps, so
-    // the attempt-1 runner's fence is stale from here on.
+    // the attempt-1 runner's fence is stale from here on. It keeps its created_at, so the claim order serves it
+    // next: a candidate is waiting on it. Attempt 1's summary stays on its own check run.
     db
       .prepare(
         `UPDATE ci_jobs SET status = 'queued', check_run_id = ?6, claimed_by = NULL, claim_id = NULL, lease_until = NULL,
-                started_at = NULL, finished_at = NULL
+                started_at = NULL, finished_at = NULL, summary = NULL
           WHERE id = ?1 AND repo_id = ?2 AND generation = ?3 AND claimed_by = ?4 AND status = 'failure' AND finished_at = ?5
             AND EXISTS (SELECT 1 FROM check_runs WHERE id = ?6 AND retry_of IS NOT NULL)`,
       )
@@ -137,7 +146,6 @@ export function retryStatements(db: D1Database, r: RetryInput): { statements: D1
       )
       .bind(retryRunId, flakeId, r.repoId),
   ];
-  return { statements, retryRunId, flakeId };
 }
 
 export interface RetryOutcome {
@@ -157,6 +165,8 @@ export function retryOutcome(row: { retry_run_id: string | null; flake_id: strin
 // ---------------------------------------------------------------------------
 // Registry reads
 // ---------------------------------------------------------------------------
+
+const QUARANTINE_COLUMNS = 'name, reason, quarantined_by, created_at, expires_at';
 
 interface QuarantineRow {
   name: string;
@@ -254,7 +264,7 @@ export async function listFlakes(
   const now = Date.now();
   const [quarantines, flakes] = await env.DB.batch([
     env.DB.prepare(
-      `SELECT name, reason, quarantined_by, created_at, expires_at FROM check_quarantines
+      `SELECT ${QUARANTINE_COLUMNS} FROM check_quarantines
         WHERE repo_id = ?1 AND expires_at > ?2 ORDER BY name LIMIT ${FLAKE_LIMITS.quarantinesMax}`,
     ).bind(repo.id, now),
     env.DB.prepare(
@@ -322,7 +332,8 @@ function parseExpiry(raw: unknown, now: number): ServiceResult<number> {
 export async function quarantineCheck(env: Env, repo: RepoRow, actor: Actor, rawName: string, input: unknown): Promise<ServiceResult<QuarantineView>> {
   const name = checkName(rawName);
   if (!name.ok) return name;
-  const body = input !== null && typeof input === 'object' && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return fail(400, 'body must be a JSON object', 'INVALID_BODY');
+  const body = input as Record<string, unknown>;
   let reason: string | null = null;
   if (body.reason !== undefined && body.reason !== null) {
     if (typeof body.reason !== 'string' || body.reason.length > FLAKE_LIMITS.reasonMax) {
@@ -345,7 +356,7 @@ export async function quarantineCheck(env: Env, repo: RepoRow, actor: Actor, raw
     ).bind(repo.id, name.value, reason, actor.user.login, now, expires.value),
     auditQuarantine(env.DB, 'check.quarantined', repo, name.value, actor, now, written),
     env.DB.prepare(
-      `SELECT name, reason, quarantined_by, created_at, expires_at FROM check_quarantines q
+      `SELECT ${QUARANTINE_COLUMNS} FROM check_quarantines q
         WHERE q.repo_id = ?1 AND q.name = ?2 AND q.created_at = ?3 AND q.quarantined_by = ?4`,
     ).bind(repo.id, name.value, now, actor.user.login),
   ]);
@@ -361,7 +372,7 @@ export async function restoreCheck(env: Env, repo: RepoRow, actor: Actor, rawNam
   const now = Date.now();
   const [read] = await env.DB.batch([
     env.DB.prepare(
-      `SELECT name, reason, quarantined_by, created_at, expires_at FROM check_quarantines
+      `SELECT ${QUARANTINE_COLUMNS} FROM check_quarantines
         WHERE repo_id = ?1 AND name = ?2 AND expires_at > ?3`,
     ).bind(repo.id, name.value, now),
     auditQuarantine(env.DB, 'check.restored', repo, name.value, actor, now, `q.expires_at > ${now}`),
