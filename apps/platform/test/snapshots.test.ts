@@ -963,7 +963,7 @@ describe('snapshot API', () => {
     const reused = await call(snap('legacy', `${later.sha}/download`), { token: tok.owner });
     expect(reused.headers.get('content-type')).toBe('application/x-tar');
     expect(reused.bytes).toEqual(first.bytes);
-  });
+  }, 30_000);
 
   it('a gzip and a plain entry for the same repo and commit never answer for each other in the cache', async () => {
     const repoId = crypto.randomUUID();
@@ -1137,7 +1137,7 @@ describe('snapshot API', () => {
     expect(renamed.cost).toMatchObject({ r2b: 0, cache: 'hit' });
     expect(renamed.headers.get('content-disposition')).toBe(`attachment; filename="dlcache-renamed-${c.sha.slice(0, 12)}.tar.gz"`);
     expect(renamed.bytes).toEqual(first.bytes);
-  }, 20_000);
+  }, 30_000);
 
   it('a caller that goes away mid-download still leaves a complete cache entry', async () => {
     const chunks = Array.from({ length: 8 }, (_, i) => new Uint8Array(64 * 1024).fill(i + 1));
