@@ -19,7 +19,7 @@ import { readdirSync, rmSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gitEnv, runGit } from './git.js';
 import { nodeFetch } from './http.js';
-import { extractTar } from './untar.js';
+import { extractArchive } from './archive.js';
 
 export class CliError extends Error {
   /**
@@ -143,7 +143,7 @@ async function downloadSnapshot(o, path, meta, dir) {
     discard(res.body);
     throw new Error(`download served ${servedSha}, expected ${meta.sha}`);
   }
-  const result = await extractTar(res.body, dir);
+  const result = await extractArchive(res.body, dir);
   if (typeof meta.size === 'number' && result.bytes !== meta.size) {
     throw new Error(`downloaded ${result.bytes} bytes, metadata size is ${meta.size}`);
   }

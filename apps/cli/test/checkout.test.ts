@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { afterAll, describe, expect, it } from 'vitest';
 import { checkout } from '../src/checkout.js';
 import type { HttpFetch } from '../src/http.js';
@@ -77,6 +78,26 @@ describe('kvarm checkout', () => {
       ['GET', `/${repo.main}/download`],
     ]);
     expect(f.calls.every((c) => c.auth === 'Bearer kvarm_pat_test')).toBe(true);
+  });
+
+  it('extracts a gzip snapshot to the same tree, checking the size against the received bytes', async () => {
+    const gz = new Uint8Array(gzipSync(tarMain));
+    const f = fakeFetch({ main: ready(repo.main, gz.length) }, { [repo.main]: gz });
+    const dir = join(root, 'snap-main-gzip');
+    const r = run(f.impl, { ref: 'main', dir, pat: 'kvarm_pat_test' });
+    await expect(r.promise).resolves.toMatchObject({ source: 'snapshot', sha: repo.main, bytes: gz.length });
+    expect(diffTrees(dir, expectedMain)).toEqual({ code: 0, out: '' });
+    expect(diffTrees(dir, join(root, 'snap-main'))).toEqual({ code: 0, out: '' });
+  });
+
+  it('falls back to clone when a gzip snapshot is truncated', async () => {
+    const gz = new Uint8Array(gzipSync(tarMain));
+    const f = fakeFetch({ main: ready(repo.main, gz.length) }, { [repo.main]: gz.subarray(0, gz.length - 10) });
+    const dir = join(root, 'snap-main-gzip-trunc');
+    const r = run(f.impl, { ref: 'main', dir, pat: 'kvarm_pat_test' });
+    await expect(r.promise).resolves.toMatchObject({ source: 'clone' });
+    expect(r.stderr.join('\n')).toMatch(/snapshot download failed: .*truncated or corrupt/);
+    expect(diffTrees(dir, expectedMain)).toEqual({ code: 0, out: '' });
   });
 
   it('falls back to git clone while the demanded snapshot is building, at the demanded ref', async () => {
