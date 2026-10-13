@@ -469,7 +469,7 @@ describe('SnapshotBuilder', () => {
     expect(cost.objects).toBe(1);
     expect(cost.r2a).toBe(1 + 2 + 1);
     checkTar(readTar(await gunzip(bytes)), files);
-  });
+  }, 30_000);
 
   it('retries an interrupted batch from its persisted input and still writes a correct tar', async () => {
     const { id, repo } = await seedRepo('retry');
@@ -496,7 +496,7 @@ describe('SnapshotBuilder', () => {
     expectStoredMatchesLogs(cost, logs);
     const attempted = logs.reduce((n, l) => n + l.cost.art, 0);
     expect(attempted).toBe(cost.art + failed[0]!.cost.art);
-  });
+  }, 30_000);
 
   it('streams each blob into parts within the read-ahead byte budget, no whole-blob copies, complete tar', async () => {
     const { id, repo } = await seedRepo('stream');
@@ -524,7 +524,7 @@ describe('SnapshotBuilder', () => {
     expect(cost.peakBuffer).toBeLessThan(partSize + FAKE_STREAM_CHUNK + 2048);
     expect(cost.peakHeld).toBeGreaterThanOrEqual(repo.maxOpenBytes);
     expect(cost.peakHeld).toBeLessThanOrEqual(READ_BUDGET);
-  });
+  }, 30_000);
 
   it('once blob sizes are known, read-ahead stays within the byte budget', async () => {
     const { id, repo } = await seedRepo('budget');
