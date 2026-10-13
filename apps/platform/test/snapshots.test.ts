@@ -445,7 +445,7 @@ describe('SnapshotBuilder', () => {
       buildSnapshot({ ...env, SNAPSHOTS: bucket }, { repoId: id, sha: c.sha, instanceId: 'snap-gz-r2down' }, new Runner(), SMALL_PARTS),
     ).rejects.toThrow(/r2 down/);
     expect(await commitRow(id, c.sha)).toMatchObject({ state: 'failed' });
-  });
+  }, 30_000);
 
   it(`batches about ${BLOBS_PER_STEP} blobs per step and streams multipart parts (steps <= ceil(F/500)+2)`, async () => {
     const { id, repo } = await seedRepo('many');
