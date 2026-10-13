@@ -517,6 +517,42 @@ export const OPERATIONS = Object.freeze([
     params: [REPO, CHANGE],
   }),
 
+  // --- flaky checks: retry-then-classify registry and quarantine ------------
+  define({
+    name: 'list_flakes',
+    command: ['flake', 'list'],
+    family: 'flakes',
+    description:
+      'Flaky required checks: checks quarantined now (reason, who, expiry) and flake entries, newest first (a required CI job that failed once and passed its one automatic retry on the same tree). Bounded pages with nextCursor.',
+    method: 'GET',
+    path: '/repos/{repo}/flakes',
+    params: [REPO, query('check', 'string', 'Only flakes of this check name'), LIMIT(100), CURSOR],
+  }),
+  define({
+    name: 'quarantine_check',
+    command: ['flake', 'quarantine'],
+    family: 'flakes',
+    description:
+      'Quarantine a check by name (repo admins only; audited): it still runs but is neutral, never satisfying or blocking the checks gate, and gets no automatic retry. A branch rule that names it still requires it. Expires after 7 days unless expiresAt is given (at most 90 days).',
+    method: 'POST',
+    path: '/repos/{repo}/flakes/{check}/quarantine',
+    params: [
+      REPO,
+      pathArg('check', 'Check name (CI job name; kvarm/ checks cannot be quarantined)'),
+      body('reason', 'string', 'Why the check is quarantined (at most 500 characters)'),
+      body('expiresAt', 'string', 'ISO 8601 time the quarantine ends (default 7 days, at most 90 days ahead)'),
+    ],
+  }),
+  define({
+    name: 'restore_check',
+    command: ['flake', 'restore'],
+    family: 'flakes',
+    description: 'End a check quarantine (repo admins only; audited): the check counts as required again on every tree.',
+    method: 'POST',
+    path: '/repos/{repo}/flakes/{check}/restore',
+    params: [REPO, pathArg('check', 'Check name')],
+  }),
+
   // --- merge queue / integration train --------------------------------------
   define({
     name: 'enqueue_change',

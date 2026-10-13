@@ -53,7 +53,7 @@ describe('operation registry', () => {
 
   it('covers every implemented operation family', () => {
     const families = new Set(OPERATIONS.map((o) => o.family));
-    for (const f of ['repos', 'content', 'compare', 'workspaces', 'changes', 'nexus', 'candidates', 'orgs', 'agents', 'branch-rules', 'attribution', 'queue', 'tasks', 'reviews', 'dependencies']) {
+    for (const f of ['repos', 'content', 'compare', 'workspaces', 'changes', 'nexus', 'candidates', 'orgs', 'agents', 'branch-rules', 'attribution', 'queue', 'tasks', 'reviews', 'dependencies', 'flakes']) {
       expect(families, f).toContain(f);
     }
     expect(findOperation('list_tasks')).toMatchObject({ command: ['task', 'list'], method: 'GET', path: '/repos/{repo}/tasks', readOnly: true });
@@ -64,6 +64,9 @@ describe('operation registry', () => {
     expect(findCommand(['task', 'get'])?.name).toBe('get_task');
     // Arena ranking is reachable as a tool (VAL-CROSS-012).
     expect(findOperation('rank_arena')?.path).toBe('/repos/{repo}/arenas/{id}/candidates');
+    expect(findOperation('list_flakes')).toMatchObject({ command: ['flake', 'list'], method: 'GET', path: '/repos/{repo}/flakes', readOnly: true });
+    expect(findOperation('quarantine_check')).toMatchObject({ command: ['flake', 'quarantine'], method: 'POST', path: '/repos/{repo}/flakes/{check}/quarantine' });
+    expect(findOperation('restore_check')).toMatchObject({ command: ['flake', 'restore'], method: 'POST', path: '/repos/{repo}/flakes/{check}/restore' });
   });
 
   it('registers review, approval and escalation operations', () => {
