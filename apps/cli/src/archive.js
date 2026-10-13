@@ -33,7 +33,7 @@ export const RATIO_FLOOR = 64 * 1024 * 1024;
  * Reads up to the first two bytes and returns whether they are the gzip
  * magic, plus a source that replays everything read.
  * @param {AsyncIterable<Uint8Array>} source
- * @returns {Promise<{ gzip: boolean, source: AsyncIterable<Uint8Array> }>}
+ * @returns {Promise<{ gzip: boolean, source: AsyncIterable<Uint8Array>, close: () => Promise<void> }>}
  */
 async function sniff(source) {
   const it = source[Symbol.asyncIterator]();
@@ -57,6 +57,11 @@ async function sniff(source) {
   const gzip = n === 2 && head[0] === 0x1f && head[1] === 0x8b;
   return {
     gzip,
+    // An unstarted generator's return() skips its finally, so releasing the
+    // body on an early failure goes through the underlying iterator.
+    close: async () => {
+      await it.return?.().catch(() => undefined);
+    },
     source: (async function* () {
       try {
         yield* held;
@@ -125,11 +130,18 @@ export async function extractArchive(source, dest, limits = {}) {
     ratioFloor: limits.ratioFloor ?? RATIO_FLOOR,
   };
   const sniffed = await sniff(source);
-  if (!sniffed.gzip) {
-    const r = await extractTar(sniffed.source, dest);
-    return { ...r, tarBytes: r.bytes, compressed: false };
+  try {
+    if (!sniffed.gzip) {
+      const r = await extractTar(sniffed.source, dest);
+      return { ...r, tarBytes: r.bytes, compressed: false };
+    }
+    // gunzip only ends once its input has ended, so by the time extractTar
+    // returns the tally holds every byte of the download: the caller's size
+    // check does not depend on the decoder stopping early.
+    const tally = { compressed: 0 };
+    const r = await extractTar(gunzipBounded(sniffed.source, tally, l), dest);
+    return { ...r, bytes: tally.compressed, tarBytes: r.bytes, compressed: true };
+  } finally {
+    await sniffed.close();
   }
-  const tally = { compressed: 0 };
-  const r = await extractTar(gunzipBounded(sniffed.source, tally, l), dest);
-  return { ...r, bytes: tally.compressed, tarBytes: r.bytes, compressed: true };
 }

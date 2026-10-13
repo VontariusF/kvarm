@@ -196,6 +196,7 @@ type Resolved =
 
 interface ClaimRow {
   tree_state: string | null;
+  r2_key: string | null;
   builder: string | null;
   commit_state: string;
 }
@@ -257,8 +258,7 @@ async function resolveStep(env: Env, p: Required<SnapshotParams> & { instanceId:
           `INSERT INTO snapshot_trees (repo_id, tree, state, builder, r2_key, created_at)
            VALUES (?1, ?2, 'building', ?3, ?4, ?5)
            ON CONFLICT (repo_id, tree) DO UPDATE SET
-             state = 'building', builder = excluded.builder, created_at = excluded.created_at, error = NULL,
-             r2_key = excluded.r2_key
+             state = 'building', builder = excluded.builder, created_at = excluded.created_at, error = NULL
            WHERE snapshot_trees.state = 'failed'
               OR (snapshot_trees.state = 'building' AND snapshot_trees.created_at < ?6)`,
         )
@@ -283,7 +283,7 @@ async function resolveStep(env: Env, p: Required<SnapshotParams> & { instanceId:
         .bind(p.repoId, p.sha, now, tree),
       db
         .prepare(
-          `SELECT t.state AS tree_state, t.builder, c.state AS commit_state
+          `SELECT t.state AS tree_state, t.r2_key, t.builder, c.state AS commit_state
              FROM snapshot_commits c
              LEFT JOIN snapshot_trees t ON t.repo_id = c.repo_id AND t.tree = c.tree
             WHERE c.repo_id = ?1 AND c.sha = ?2`,
@@ -292,8 +292,11 @@ async function resolveStep(env: Env, p: Required<SnapshotParams> & { instanceId:
     ]);
     const row = (results[3]?.results as ClaimRow[] | undefined)?.[0];
     if (row && row.tree_state === 'building' && row.builder === p.instanceId && row.commit_state !== 'ready') {
-      // The cost is stored when the build finishes.
-      return { action: 'build', tree, key, artifactsName: repo.artifacts_name, mtime: commit.committedAt, cost };
+      // The cost is stored when the build finishes. A re-claimed (failed or
+      // stale) row keeps the key it already names, so a takeover overwrites
+      // the same object instead of orphaning the earlier attempt's, and a
+      // build that began under a legacy `.tar` key finishes as plain tar.
+      return { action: 'build', tree, key: row.r2_key ?? key, artifactsName: repo.artifacts_name, mtime: commit.committedAt, cost };
     }
     // This attempt claimed the commit and needs nothing more (reuse, or a
     // wait on another builder): store its measured cost over the placeholder.
@@ -397,8 +400,21 @@ class PartWriter {
         await this.uploadFull();
       }
     } catch (err) {
+      // Nothing reads the compressor any more: abort it so a pending
+      // `ready`/`close` rejects instead of waiting on backpressure forever.
       this.failure ??= err;
+      await reader.cancel(err).catch(() => undefined);
+      await this.compressor?.abort(err).catch(() => undefined);
     }
+  }
+
+  /** Drops the compressor of a step that failed, so a retry never races its uploads. */
+  async abort(err: unknown): Promise<void> {
+    this.failure ??= err;
+    if (!this.compressor || this.closed) return;
+    this.closed = true;
+    await this.compressor.abort(err).catch(() => undefined);
+    await this.drained;
   }
 
   private check(): void {
@@ -712,6 +728,9 @@ async function batchStep(
         await writer.flushFull();
       }
       state.done = stack.length === 0;
+    }).catch(async (err: unknown) => {
+      await writer.abort(err);
+      throw err;
     });
     if (!state.done) return { state, carry: await writer.rest() };
     writer.push(tarEnd());

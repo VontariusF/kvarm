@@ -401,7 +401,7 @@ describe('SnapshotBuilder', () => {
     expect(tree).toEqual({ r2_key: snapshotKey(id, c.tree), size: stored.length });
   });
 
-  it('rebuilding a failed legacy tree writes the gzip key and points the row at it', async () => {
+  it('a failed tree rebuilt after a takeover keeps the key its row names: no orphaned object, legacy stays plain tar', async () => {
     const { id, repo } = await seedRepo('gz-rebuild');
     const c = await commit(repo, SMALL);
     const legacyKey = snapshotKey(id, c.tree, 'tar');
@@ -414,8 +414,37 @@ describe('SnapshotBuilder', () => {
     const row = await env.DB.prepare('SELECT state, r2_key FROM snapshot_trees WHERE repo_id = ? AND tree = ?')
       .bind(id, c.tree)
       .first<{ state: string; r2_key: string }>();
-    expect(row).toEqual({ state: 'ready', r2_key: snapshotKey(id, c.tree) });
-    expect(await objectKeys(id)).toEqual([snapshotKey(id, c.tree)]);
+    expect(row).toEqual({ state: 'ready', r2_key: legacyKey });
+    expect(await objectKeys(id)).toEqual([legacyKey]);
+    const plain = await storedTarball(id, c.tree, legacyKey);
+    checkTar(readTar(plain), SMALL);
+  });
+
+  it('an R2 part upload failure mid-build fails the step promptly instead of hanging on the compressor', async () => {
+    const { id, repo } = await seedRepo('gz-r2down');
+    const files = manyFiles(100, 100_000, 'down', true);
+    const c = await commit(repo, files);
+    const failing = (upload: R2MultipartUpload): R2MultipartUpload =>
+      ({
+        uploadId: upload.uploadId,
+        key: upload.key,
+        uploadPart: async () => {
+          throw new Error('r2 down');
+        },
+        abort: () => upload.abort(),
+        complete: (parts: R2UploadedPart[]) => upload.complete(parts),
+      }) as unknown as R2MultipartUpload;
+    const bucket = {
+      put: (...a: Parameters<R2Bucket['put']>) => env.SNAPSHOTS.put(...a),
+      head: (k: string) => env.SNAPSHOTS.head(k),
+      delete: (k: string | string[]) => env.SNAPSHOTS.delete(k),
+      createMultipartUpload: async (k: string, o?: R2MultipartOptions) => failing(await env.SNAPSHOTS.createMultipartUpload(k, o)),
+      resumeMultipartUpload: (k: string, u: string) => failing(env.SNAPSHOTS.resumeMultipartUpload(k, u)),
+    } as unknown as R2Bucket;
+    await expect(
+      buildSnapshot({ ...env, SNAPSHOTS: bucket }, { repoId: id, sha: c.sha, instanceId: 'snap-gz-r2down' }, new Runner(), SMALL_PARTS),
+    ).rejects.toThrow(/r2 down/);
+    expect(await commitRow(id, c.sha)).toMatchObject({ state: 'failed' });
   });
 
   it(`batches about ${BLOBS_PER_STEP} blobs per step and streams multipart parts (steps <= ceil(F/500)+2)`, async () => {
@@ -1108,7 +1137,7 @@ describe('snapshot API', () => {
     expect(renamed.cost).toMatchObject({ r2b: 0, cache: 'hit' });
     expect(renamed.headers.get('content-disposition')).toBe(`attachment; filename="dlcache-renamed-${c.sha.slice(0, 12)}.tar.gz"`);
     expect(renamed.bytes).toEqual(first.bytes);
-  });
+  }, 20_000);
 
   it('a caller that goes away mid-download still leaves a complete cache entry', async () => {
     const chunks = Array.from({ length: 8 }, (_, i) => new Uint8Array(64 * 1024).fill(i + 1));

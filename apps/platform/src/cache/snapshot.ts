@@ -46,23 +46,29 @@ const LOOKUP_ORDER: SnapshotFormat[] = ['gzip', 'tar'];
 
 /** The cached tarball of a ready commit, or null (recorded as the request's cache miss). */
 export async function matchSnapshot(repoId: string, sha: string): Promise<SnapshotBytes | null> {
-  for (const format of LOOKUP_ORDER) {
-    let hit: Response | undefined;
-    try {
-      hit = await caches.default.match(snapshotCacheKey(repoId, sha, format));
-    } catch {
-      hit = undefined;
-    }
+  // The row that names the format is not read before the cache, so ask for
+  // both at once; the lookups are local to the colo.
+  const hits = await Promise.all(
+    LOOKUP_ORDER.map(async (format) => {
+      try {
+        return { format, hit: await caches.default.match(snapshotCacheKey(repoId, sha, format)) };
+      } catch {
+        return { format, hit: undefined };
+      }
+    }),
+  );
+  let found: SnapshotBytes | null = null;
+  for (const { format, hit } of hits) {
     const tree = hit?.headers.get(TREE_HEADER);
     const size = Number(hit?.headers.get(SIZE_HEADER));
-    if (hit?.body && tree && Number.isSafeInteger(size)) {
-      markCache('hit');
-      return { body: hit.body, size, tree, format };
+    if (!found && hit?.body && tree && Number.isSafeInteger(size)) {
+      found = { body: hit.body, size, tree, format };
+    } else {
+      await hit?.body?.cancel().catch(() => undefined);
     }
-    await hit?.body?.cancel().catch(() => undefined);
   }
-  markCache('miss');
-  return null;
+  markCache(found ? 'hit' : 'miss');
+  return found;
 }
 
 /**
