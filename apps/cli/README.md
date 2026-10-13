@@ -160,6 +160,14 @@ rematerializes every job from an empty directory (caches included). The
 runner prints `workdir: warm` or `workdir: fresh` per job and
 `reported <conclusion> for <job> (<id>) in <ms> ms` (claim to report).
 
+A required job that fails is requeued once by the platform for a second
+attempt on the same commit: the runner claims it again like any queued job
+(same job id, the next generation; a report under the old generation is
+refused as stale). The report reply carries `retry` (the attempt-2 run) after
+a first failure and `flake` after a second-attempt pass. `kvarm flake list`,
+`kvarm flake quarantine` and `kvarm flake restore` read the flake registry and
+quarantine checks (architecture §0.3).
+
 ## Performance
 
 See `docs/benchmarks/clone-vs-snapshot.md` (`scripts/bench-clone-vs-snapshot.mjs`).

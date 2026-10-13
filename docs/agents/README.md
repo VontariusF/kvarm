@@ -60,7 +60,7 @@ Because `list_repos` is account-level, **verify an agent token with `get_repo`**
 
 ## Verification, in one line
 
-`tools/list` returns the registry (91 tools at the time of writing; the exact number follows `packages/ops`), then call `get_repo` with `{"repo":"<owner>/<repo>"}`. A result with `isError: true` carries `{status, error, code}` and is the same body the REST route returns.
+`tools/list` returns the registry (94 tools at the time of writing; the exact number follows `packages/ops`), then call `get_repo` with `{"repo":"<owner>/<repo>"}`. A result with `isError: true` carries `{status, error, code}` and is the same body the REST route returns.
 
 ## Troubleshooting (all clients)
 

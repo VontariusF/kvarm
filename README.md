@@ -241,13 +241,15 @@ CI configuration lives at `.kvarm/ci.json` in the repository:
 {"jobs":[{"name":"test","run":"npm test","required":true,"timeoutSeconds":900}]}
 ```
 
+A required job that fails gets exactly one automatic second attempt on the same commit and tree (a composed train tree retries only that tree). A pass on the second attempt counts as passed and is recorded as a flake; a second failure blocks as before and is never retried again. Repo admins can quarantine a flaky check by name for up to 90 days (7 by default): it keeps running but is neutral, neither satisfying nor blocking the required checks, unless a branch rule names it explicitly. `kvarm flake list|quarantine|restore` (MCP `list_flakes`, `quarantine_check`, `restore_check`) show and manage both; architecture §0.3 has the rules.
+
 Details (warm working directories, extraction safety, exit codes): [`apps/cli/README.md`](apps/cli/README.md).
 
 ## MCP
 
 `POST /mcp` is a stateless Streamable HTTP MCP server (`@modelcontextprotocol/sdk`). Authenticate with `Authorization: Bearer <token>`: a personal access token with the `api` scope or an agent token. Every tool runs the same service code and the same authorization as REST.
 
-The 91 tools come from the shared registry, grouped by family: `user`, `repos`, `content`, `compare`, `workspaces`, `dependencies`, `changes`, `queue`, `reviews`, `tasks`, `nexus` (`forecast`, `get_overlap`, intents), `candidates` (compose, arenas), `orgs`, `agents`, `attribution` (`record_decision`, `get_context`) and `branch-rules`. `kvarm --help` lists each tool with its CLI command; `scripts/mcp-agent.mjs` is a scripted MCP client.
+The 94 tools come from the shared registry, grouped by family: `user`, `repos`, `content`, `compare`, `workspaces`, `dependencies`, `changes`, `queue`, `reviews`, `tasks`, `nexus` (`forecast`, `get_overlap`, intents), `candidates` (compose, arenas), `orgs`, `agents`, `attribution` (`record_decision`, `get_context`), `branch-rules` and `flakes` (`list_flakes`, `quarantine_check`, `restore_check`). `kvarm --help` lists each tool with its CLI command; `scripts/mcp-agent.mjs` is a scripted MCP client.
 
 Setup guides for Claude Code, Codex CLI, Cursor and generic MCP clients, the agent workflow and an `AGENTS.md` template are in [`docs/agents/`](docs/agents/README.md).
 
@@ -270,7 +272,7 @@ All endpoints are under `/api/v1`, take and return camelCase JSON with ISO 8601 
 | snapshots | `GET/POST …/snapshots/:ref`, `GET …/snapshots/:sha/download` (zstd-compressed tar; `Accept: application/zstd` serves stored bytes, otherwise the Worker decompresses) |
 | changes | `POST/GET …/changes`, `GET/PATCH …/changes/:n`, `POST …/changes/:n/merge`, `GET …/changes/:n/mergeability`, `GET …/changes/:n/checks` |
 | merge queue | `POST/DELETE …/changes/:n/enqueue`, `GET …/queue`, `GET …/train` |
-| checks and CI | `GET …/commits/:sha/status`, `POST …/check-runs`, `PATCH …/check-runs/:id`, `POST …/ci/jobs/claim`, `POST …/ci/jobs/:id/heartbeat`, `POST …/ci/jobs/:id/report` (`ci` scope) |
+| checks and CI | `GET …/commits/:sha/status`, `POST …/check-runs`, `PATCH …/check-runs/:id`, `POST …/ci/jobs/claim`, `POST …/ci/jobs/:id/heartbeat`, `POST …/ci/jobs/:id/report` (`ci` scope), `GET …/flakes`, `POST …/flakes/:check/quarantine`, `POST …/flakes/:check/restore` (repo admins) |
 | reviews | `GET/PUT …/review-policy`, `GET/POST …/changes/:n/reviews`, `POST …/changes/:n/approve`, `…/request-changes`, `…/reviewers/assign`, `…/escalations/:id/resolve`, `GET …/reviews/pending` |
 | workspaces and Nexus | `POST/GET …/workspaces`, `GET …/workspaces/:id`, `POST …/workspaces/:id/change-set`, `POST …/workspaces/:id/abandon`, `GET/POST …/workspaces/:id/intent`, `GET …/forecast`, `GET …/workspaces/overlap` |
 | dependencies | `POST/GET …/workspaces/:id/dependencies`, `POST …/workspaces/:id/dependencies/:dep/repin`, `DELETE …/workspaces/:id/dependencies/:dep` |
@@ -334,7 +336,7 @@ Not built in this version, recorded for after the submission:
 
 - The collaborative UI pass (new pages and the visual direction); the existing pages are unchanged.
 - WorkOS sign-in (configured by the secrets above; personal access tokens are the supported path today).
-- Flaky-test retry and quarantine, revert change sets, inbound incident webhooks, outbound webhook delivery (the `kvarm.task.created` events are stored, not delivered), audit export and `get_audit`.
+- Revert change sets, inbound incident webhooks, outbound webhook delivery (the `kvarm.task.created` events are stored, not delivered), audit export and `get_audit`.
 - Contract capsules, semantic packets, hotspot suggestions, priority credits, resource lifecycle and crash reconciliation after a ref move.
 - Advisory low-signal test flags and an auto-updating repository wiki.
 - Adopting Effect TS across the codebase.
