@@ -76,7 +76,7 @@ missing or empty.
    metadata `size` and extracts the tarball, which is gzip-compressed for new
    snapshots and plain tar for older ones (detected by the gzip magic bytes,
    not by headers). Every extraction safety check runs on the decompressed
-   stream, and output past 8 GiB or a 1000:1 expansion ratio is refused.
+   stream, and output past 8 GiB or a 250:1 expansion ratio is refused.
    Output: `source: snapshot`.
 3. Otherwise it runs `git clone --no-checkout` + `git checkout <ref>`.
    Output: `source: clone`. This covers a build in progress (including the one

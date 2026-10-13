@@ -84,7 +84,11 @@ export interface BuildCost {
   bytes: number;
   /** Size of the largest blob the binding returned (held whole while it streams). */
   largestBlob: number;
-  /** Most unflushed tar bytes buffered at once before a part upload. */
+  /**
+   * Most unflushed stored bytes buffered at once before a part upload
+   * (compressed bytes for a gzip tarball; the tar bytes still inside the
+   * compressor are bounded by its write backpressure and not counted).
+   */
   peakBuffer: number;
   /** Most binding-returned blob bytes held at once (read ahead or streaming). */
   peakHeld: number;

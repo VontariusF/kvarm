@@ -14,7 +14,8 @@
  * the received pack size for git (`.git/objects/pack/*.pack`), and the
  * checked-out tree size. The first run of each target checks that all three
  * trees are identical (`diff -r -x .git`). One extra untimed download per
- * target records how large the tarball would be gzip-compressed.
+ * target records how large the tarball is gzip-compressed (legacy plain
+ * snapshots) or decompressed (new gzip snapshots).
  *
  * Targets:
  * - fixture  <owner>/fixture-1m at bench-head (read-only; never pushed or deleted).
@@ -32,7 +33,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { request } from 'node:https';
-import { createGzip } from 'node:zlib';
+import { createGunzip, createGzip } from 'node:zlib';
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { arch, cpus, platform, release, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -124,18 +125,36 @@ async function ensureReady(repo, ref) {
   return r.body;
 }
 
-/** Downloads the tarball once (untimed) and returns its gzip -6 size. */
+/**
+ * Downloads the tarball once (untimed). Legacy snapshots are plain tar, so the
+ * gzip -6 size is measured here; new snapshots arrive gzip-compressed (magic
+ * bytes 1f 8b), so their received size is the gzip size and the tar size is
+ * measured by decompressing.
+ */
 function gzipSize(repo, sha) {
   return new Promise((resolve, reject) => {
     const url = `${BASE}/api/v1/repos/${OWNER}/${repo}/snapshots/${sha}/download`;
     const req = request(url, { headers: { authorization: `Bearer ${process.env.KVARM_PAT}` } }, (res) => {
       if (res.statusCode !== 200) return reject(new Error(`download ${res.statusCode}`));
-      let n = 0;
-      const gz = createGzip({ level: 6 });
-      gz.on('data', (c) => (n += c.length));
-      gz.on('end', () => resolve(n));
-      gz.on('error', reject);
-      res.pipe(gz);
+      let received = 0;
+      let out = 0;
+      let stored;
+      let coder;
+      res.on('data', (chunk) => {
+        received += chunk.length;
+        if (!coder) {
+          stored = chunk[0] === 0x1f && chunk[1] === 0x8b ? 'gzip' : 'tar';
+          coder = stored === 'gzip' ? createGunzip() : createGzip({ level: 6 });
+          coder.on('data', (c) => (out += c.length));
+          coder.on('error', reject);
+          coder.on('end', () =>
+            resolve(stored === 'gzip' ? { stored, tarBytes: out, gzipBytes: received } : { stored, tarBytes: received, gzipBytes: out }),
+          );
+        }
+        coder.write(chunk);
+      });
+      res.on('end', () => coder?.end());
+      res.on('error', reject);
     });
     req.on('error', reject);
     req.end();
@@ -207,13 +226,13 @@ async function bench(t) {
     const ms = rows.map((r) => r.ms);
     summary[v] = { minMs: Math.min(...ms), medianMs: median(ms), maxMs: Math.max(...ms), transferBytes: rows[0].transferBytes, treeBytes: rows[0].treeBytes };
   }
-  const gzipBytes = await gzipSize(t.repo, meta.sha);
+  const { stored, tarBytes, gzipBytes } = await gzipSize(t.repo, meta.sha);
   return {
     target: t.name,
     repo: `${OWNER}/${t.repo}`,
     ref: t.ref,
     sha: meta.sha,
-    snapshot: { size: meta.size, gzipBytes, files: meta.files, reused: meta.reused ?? false },
+    snapshot: { size: meta.size, stored, tarBytes, gzipBytes, files: meta.files, reused: meta.reused ?? false },
     summary,
     speedup: { vsClone: round(summary.clone.medianMs / summary.snapshot.medianMs), vsShallow: round(summary.shallow.medianMs / summary.snapshot.medianMs) },
     runs,
@@ -278,11 +297,13 @@ function markdown(record) {
   for (const t of record.targets) {
     const s = t.summary;
     const vsShallow = (s.snapshot.transferBytes / s.shallow.transferBytes).toFixed(1);
-    const gz = (t.snapshot.size / t.snapshot.gzipBytes).toFixed(1);
+    const gz = ((t.snapshot.tarBytes ?? t.snapshot.size) / t.snapshot.gzipBytes).toFixed(1);
     lines.push(
       `- **${t.target}:** the snapshot checkout is ${relative(s.snapshot.medianMs, s.clone.medianMs)} a full \`git clone\` + checkout and ${relative(s.snapshot.medianMs, s.shallow.medianMs)} a shallow clone (medians). ` +
-        `The tarball is plain ustar served uncompressed: ${fmtBytes(s.snapshot.transferBytes)} on the wire versus ${fmtBytes(s.shallow.transferBytes)} for the zlib-compressed shallow pack (${vsShallow}×). ` +
-        `gzip -6 of the same tarball is ${fmtBytes(t.snapshot.gzipBytes)} (${gz}× smaller).`,
+        (t.snapshot.stored === 'gzip'
+          ? `The tarball is stored gzip-compressed: ${fmtBytes(s.snapshot.transferBytes)} on the wire (${fmtBytes(t.snapshot.tarBytes)} of tar, ${gz}× smaller) versus ${fmtBytes(s.shallow.transferBytes)} for the zlib-compressed shallow pack (${vsShallow}×).`
+          : `The tarball is plain ustar served uncompressed: ${fmtBytes(s.snapshot.transferBytes)} on the wire versus ${fmtBytes(s.shallow.transferBytes)} for the zlib-compressed shallow pack (${vsShallow}×). ` +
+            `gzip -6 of the same tarball is ${fmtBytes(t.snapshot.gzipBytes)} (${gz}× smaller).`),
     );
   }
   lines.push('', '## All runs', '', '| target | run | variant | wall ms | transfer bytes |', '| --- | ---: | --- | ---: | ---: |');

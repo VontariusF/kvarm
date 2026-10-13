@@ -83,13 +83,13 @@ describe('extractArchive', () => {
     const bomb = tarWithZeros(40 * 1024 * 1024);
     expect(bomb.length).toBeLessThan(1024 * 1024);
     await expect(extractArchive(chunked(bomb), join(root, 'bomb-ratio'), { ratioFloor: 1024 * 1024 })).rejects.toThrow(
-      /expands more than 1000x/,
+      /expands more than 250x/,
     );
   });
 
   it('refuses the same bomb under the default limits once it passes the ratio floor', async () => {
     const bomb = tarWithZeros(96 * 1024 * 1024);
-    await expect(extractArchive(chunked(bomb), join(root, 'bomb-default'))).rejects.toThrow(/expands more than 1000x/);
+    await expect(extractArchive(chunked(bomb), join(root, 'bomb-default'))).rejects.toThrow(/expands more than 250x/);
   });
 
   it('still applies the path safety checks to the decompressed stream', async () => {

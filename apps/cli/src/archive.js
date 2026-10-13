@@ -17,8 +17,12 @@ import { TarError, extractTar } from './untar.js';
 
 /** Largest decompressed snapshot accepted. */
 export const MAX_DECOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024;
-/** Largest decompressed/compressed ratio accepted; real source trees stay far below it. */
-export const MAX_RATIO = 1000;
+/**
+ * Largest decompressed/compressed ratio accepted. Deflate cannot exceed about
+ * 1032:1, so this sits well below that; real source trees compress 3-15x and
+ * a refusal only costs a fallback to a clone.
+ */
+export const MAX_RATIO = 250;
 /** The ratio is only judged once this much output exists, so tiny archives cannot trip it. */
 export const RATIO_FLOOR = 64 * 1024 * 1024;
 
