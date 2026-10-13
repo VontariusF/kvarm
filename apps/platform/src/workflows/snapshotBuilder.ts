@@ -20,6 +20,15 @@
  *   finish    marks the tree and every commit waiting on it ready. If the
  *             repo was deleted during the build, it removes the tarball.
  *
+ * New tarballs are gzip-compressed at build time (key `.tar.gz`, issue #20)
+ * with CompressionStream('gzip'), whose level is the runtime default (it has
+ * no level option). Compression state cannot cross Workflow steps, so each
+ * step ends its gzip member and the object is a concatenation of members
+ * (valid gzip; one member per step costs a little ratio). What a step carries
+ * to the next is already-compressed bytes, so parts are cut from compressed
+ * output. A tree already built as an uncompressed `.tar` is reused as is, and
+ * a build that started with a `.tar` key finishes as plain tar.
+ *
  * Every build attempt belongs to one instance id. Terminal writes to a
  * commit row (failed, commit not found) only apply while that instance is
  * the commit's active attempt, so a superseded attempt cannot fail its
@@ -37,6 +46,9 @@ import { NonRetryableError } from 'cloudflare:workflows';
 import { decode, encode, gitModeToTar, tarEnd, tarHeader, tarPadding, type TarEntry } from '@kvarm/gitops';
 import { withRepo } from '../artifacts/repo';
 import { CostMeter, runWithMeter } from '../cost/meter';
+import { FORMAT_HTTP, formatOfKey, snapshotKey } from '../snapshotFormat';
+
+export { snapshotKey };
 
 export const BLOBS_PER_STEP = 500;
 /** R2 multipart parts must all be the same size except the last. */
@@ -99,10 +111,6 @@ export function emptyCost(): BuildCost {
     peakHeld: 0,
     reused: false,
   };
-}
-
-export function snapshotKey(repoId: string, tree: string): string {
-  return `trees/v1/${repoId}/${tree}.tar`;
 }
 
 /** The subset of WorkflowStep the builder uses, so tests can drive it directly. */
@@ -249,7 +257,8 @@ async function resolveStep(env: Env, p: Required<SnapshotParams> & { instanceId:
           `INSERT INTO snapshot_trees (repo_id, tree, state, builder, r2_key, created_at)
            VALUES (?1, ?2, 'building', ?3, ?4, ?5)
            ON CONFLICT (repo_id, tree) DO UPDATE SET
-             state = 'building', builder = excluded.builder, created_at = excluded.created_at, error = NULL
+             state = 'building', builder = excluded.builder, created_at = excluded.created_at, error = NULL,
+             r2_key = excluded.r2_key
            WHERE snapshot_trees.state = 'failed'
               OR (snapshot_trees.state = 'building' AND snapshot_trees.created_at < ?6)`,
         )
@@ -346,7 +355,15 @@ export interface BuildOptions {
 class PartWriter {
   private chunks: Uint8Array[] = [];
   private length = 0;
+  private compressor: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  private drained: Promise<void> = Promise.resolve();
+  private failure: unknown = null;
+  private closed = false;
 
+  /**
+   * In gzip mode `push` takes tar bytes and the part buffer holds compressed
+   * bytes; `carry` is the previous step's compressed leftover.
+   */
   constructor(
     private readonly bucket: R2Bucket,
     private readonly key: string,
@@ -354,14 +371,57 @@ class PartWriter {
     readonly state: BatchState,
     carry: Uint8Array,
   ) {
-    if (carry.length > 0) this.push(carry);
+    if (formatOfKey(key) === 'gzip') {
+      const cs = new CompressionStream('gzip');
+      this.compressor = cs.writable.getWriter();
+      this.drained = this.drain(cs.readable);
+    }
+    if (carry.length > 0) this.buffer(carry);
   }
 
-  push(bytes: Uint8Array): void {
+  private buffer(bytes: Uint8Array): void {
     if (bytes.length === 0) return;
     this.chunks.push(bytes);
     this.length += bytes.length;
     if (this.length > this.state.cost.peakBuffer) this.state.cost.peakBuffer = this.length;
+  }
+
+  /** Moves compressed output into the part buffer and uploads full parts as they fill. */
+  private async drain(readable: ReadableStream<Uint8Array>): Promise<void> {
+    const reader = readable.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        this.buffer(value);
+        await this.uploadFull();
+      }
+    } catch (err) {
+      this.failure ??= err;
+    }
+  }
+
+  private check(): void {
+    if (this.failure !== null) throw this.failure;
+  }
+
+  push(bytes: Uint8Array): void {
+    if (bytes.length === 0) return;
+    if (!this.compressor) return this.buffer(bytes);
+    this.compressor.write(bytes).catch((err) => {
+      this.failure ??= err;
+    });
+  }
+
+  /** Ends the gzip member (if any) and waits until every part it produced is uploaded. */
+  private async close(): Promise<void> {
+    if (!this.compressor || this.closed) return;
+    this.closed = true;
+    await this.compressor.close().catch((err) => {
+      this.failure ??= err;
+    });
+    await this.drained;
+    this.check();
   }
 
   /** Streams a blob's bytes in, uploading each full part as soon as it fills; returns the byte count. */
@@ -400,14 +460,34 @@ class PartWriter {
   private upload(): R2MultipartUpload | Promise<R2MultipartUpload> {
     if (this.state.uploadId) return this.bucket.resumeMultipartUpload(this.key, this.state.uploadId);
     return this.bucket
-      .createMultipartUpload(this.key, { httpMetadata: { contentType: 'application/x-tar' } })
+      .createMultipartUpload(this.key, this.objectOptions())
       .then((u) => {
         this.state.uploadId = u.uploadId;
         return u;
       });
   }
 
+  private objectOptions(): R2PutOptions & R2MultipartOptions {
+    const format = formatOfKey(this.key);
+    return {
+      httpMetadata: { contentType: FORMAT_HTTP[format].contentType },
+      customMetadata: { format: format === 'gzip' ? 'tar+gzip' : 'tar' },
+    };
+  }
+
+  /** Gzip mode: waits until the compressor accepts more (the drain uploads parts). Plain: uploads full parts. */
   async flushFull(): Promise<void> {
+    if (this.compressor) {
+      await this.compressor.ready.catch((err) => {
+        this.failure ??= err;
+      });
+      this.check();
+      return;
+    }
+    await this.uploadFull();
+  }
+
+  private async uploadFull(): Promise<void> {
     while (this.length >= this.partSize) {
       const upload = await this.upload();
       const partNumber = this.state.parts.length + 1;
@@ -420,9 +500,10 @@ class PartWriter {
 
   /** Writes the remaining bytes as a single object or the final part, then completes. */
   async finish(): Promise<number> {
+    await this.close();
     const size = this.state.flushed + this.length;
     if (!this.state.uploadId) {
-      await this.bucket.put(this.key, this.take(this.length), { httpMetadata: { contentType: 'application/x-tar' } });
+      await this.bucket.put(this.key, this.take(this.length), this.objectOptions());
       return size;
     }
     const upload = await this.upload();
@@ -441,7 +522,9 @@ class PartWriter {
     return size;
   }
 
-  rest(): Uint8Array {
+  /** Ends this step's gzip member and returns the unflushed bytes to carry to the next step. */
+  async rest(): Promise<Uint8Array> {
+    await this.close();
     return this.take(this.length);
   }
 }
@@ -630,7 +713,7 @@ async function batchStep(
       }
       state.done = stack.length === 0;
     });
-    if (!state.done) return { state, carry: writer.rest() };
+    if (!state.done) return { state, carry: await writer.rest() };
     writer.push(tarEnd());
     await writer.flushFull();
     state.size = await writer.finish();

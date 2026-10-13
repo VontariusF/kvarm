@@ -12,6 +12,7 @@
  */
 
 import { markCache } from '../cost/meter';
+import { FORMAT_HTTP, type SnapshotFormat } from '../snapshotFormat';
 
 const IMMUTABLE_TTL_SECONDS = 31536000;
 const TREE_HEADER = 'x-kvarm-snapshot-tree';
@@ -19,10 +20,17 @@ const SIZE_HEADER = 'x-kvarm-snapshot-size';
 /** The Cache API refuses larger objects; storing one would only waste the write. */
 const MAX_CACHED_BYTES = 512 * 1024 * 1024;
 
-export function snapshotCacheKey(repoId: string, sha: string): Request {
+/**
+ * The entry's format is part of the key: a gzip and an uncompressed object
+ * for the same commit are different bytes and must never answer for each
+ * other. (Legacy plain entries live under the pre-gzip `/tar` path with no
+ * format parameter, so entries cached before gzip existed stay addressable.)
+ */
+export function snapshotCacheKey(repoId: string, sha: string, format: SnapshotFormat = 'tar'): Request {
   const url = new URL('https://kvarm.internal/snapshot/v1/tar');
   url.searchParams.set('repo', repoId);
   url.searchParams.set('sha', sha);
+  if (format !== 'tar') url.searchParams.set('format', format);
   return new Request(url.toString(), { method: 'GET' });
 }
 
@@ -30,25 +38,31 @@ export interface SnapshotBytes {
   body: ReadableStream<Uint8Array>;
   size: number;
   tree: string;
+  format: SnapshotFormat;
 }
+
+/** Newest format first, so a commit that somehow has both serves the compressed one. */
+const LOOKUP_ORDER: SnapshotFormat[] = ['gzip', 'tar'];
 
 /** The cached tarball of a ready commit, or null (recorded as the request's cache miss). */
 export async function matchSnapshot(repoId: string, sha: string): Promise<SnapshotBytes | null> {
-  let hit: Response | undefined;
-  try {
-    hit = await caches.default.match(snapshotCacheKey(repoId, sha));
-  } catch {
-    hit = undefined;
-  }
-  const tree = hit?.headers.get(TREE_HEADER);
-  const size = Number(hit?.headers.get(SIZE_HEADER));
-  if (!hit?.body || !tree || !Number.isSafeInteger(size)) {
+  for (const format of LOOKUP_ORDER) {
+    let hit: Response | undefined;
+    try {
+      hit = await caches.default.match(snapshotCacheKey(repoId, sha, format));
+    } catch {
+      hit = undefined;
+    }
+    const tree = hit?.headers.get(TREE_HEADER);
+    const size = Number(hit?.headers.get(SIZE_HEADER));
+    if (hit?.body && tree && Number.isSafeInteger(size)) {
+      markCache('hit');
+      return { body: hit.body, size, tree, format };
+    }
     await hit?.body?.cancel().catch(() => undefined);
-    markCache('miss');
-    return null;
   }
-  markCache('hit');
-  return { body: hit.body, size, tree };
+  markCache('miss');
+  return null;
 }
 
 /**
@@ -63,6 +77,7 @@ export function streamAndStore(
   sha: string,
   tree: string,
   object: R2ObjectBody,
+  format: SnapshotFormat,
 ): ReadableStream<Uint8Array> {
   const client = new FixedLengthStream(object.size);
   if (object.size > MAX_CACHED_BYTES) {
@@ -72,7 +87,7 @@ export function streamAndStore(
   const store = new FixedLengthStream(object.size);
   const stored = new Response(store.readable, {
     headers: {
-      'content-type': 'application/x-tar',
+      'content-type': FORMAT_HTTP[format].contentType,
       // Stored under the internal host, which no client request can address;
       // the max-age only tells the Cache API how long to keep the entry.
       'cache-control': `max-age=${IMMUTABLE_TTL_SECONDS}, immutable`,
@@ -81,7 +96,7 @@ export function streamAndStore(
     },
   });
   const storeSink = sink(store.writable);
-  const put = caches.default.put(snapshotCacheKey(repoId, sha), stored).catch(() => storeSink.drop());
+  const put = caches.default.put(snapshotCacheKey(repoId, sha, format), stored).catch(() => storeSink.drop());
   ctx.waitUntil(Promise.all([put, pumpInStep(object.body, [sink(client.writable), storeSink])]));
   return client.readable;
 }

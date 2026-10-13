@@ -331,7 +331,7 @@ Not built in this version, recorded for after the submission:
 - WorkOS sign-in (configured by the secrets above; personal access tokens are the supported path today).
 - Flaky-test retry and quarantine, revert change sets, inbound incident webhooks, outbound webhook delivery (the `kvarm.task.created` events are stored, not delivered), audit export and `get_audit`.
 - Contract capsules, semantic packets, hotspot suggestions, priority credits, resource lifecycle and crash reconciliation after a ref move.
-- Advisory low-signal test flags, snapshot compression and an auto-updating repository wiki.
+- Advisory low-signal test flags and an auto-updating repository wiki.
 - Adopting Effect TS across the codebase.
 
 ## License

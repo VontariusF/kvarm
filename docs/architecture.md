@@ -19,7 +19,7 @@ These decisions shape the whole codebase. Later sections refer back to them.
 
 ### 0.2 Out of scope for this version
 
-The following are designed but not built; the README lists them under "Deferred roadmap": flaky-test retry and quarantine, revert change sets, inbound incident webhooks and outbound webhook delivery, audit export (`get_audit`), contract capsules, semantic packets, hotspot suggestions, priority credits, resource lifecycle, crash reconciliation after a ref move, advisory low-signal test flags, snapshot compression, the collaborative UI pass and WorkOS sign-in. Code paths that would serve them either do not exist or are documented as inert.
+The following are designed but not built; the README lists them under "Deferred roadmap": flaky-test retry and quarantine, revert change sets, inbound incident webhooks and outbound webhook delivery, audit export (`get_audit`), contract capsules, semantic packets, hotspot suggestions, priority credits, resource lifecycle, crash reconciliation after a ref move, advisory low-signal test flags, the collaborative UI pass and WorkOS sign-in. Code paths that would serve them either do not exist or are documented as inert.
 
 ### 0.3 The checks gate
 
@@ -156,7 +156,7 @@ All repository routes live under `/api/v1/repos/:owner/:repo/...`. The README's 
 | area | shape |
 | --- | --- |
 | compare | `GET compare/:base...:head` (`order=path\|risk`, `limit`, `cursor`) returns base and head `{ref, sha, tree}`, `files[]` with status, modes, blob hashes, optional line stats and risk, `totals`, `totalsComplete`, a change `rating`, `truncated` and `nextCursor`; `GET compare/:base...:head/file?path=` returns hunks; `GET commits/:sha/diff` compares a commit with its first parent |
-| snapshots | `GET snapshots/:ref` (metadata, `202` while building, `404`), `POST snapshots/:ref` (explicit demand), `GET snapshots/:sha/download` (tar stream from R2) |
+| snapshots | `GET snapshots/:ref` (metadata, `202` while building, `404`), `POST snapshots/:ref` (explicit demand), `GET snapshots/:sha/download` (tarball stream from R2: gzip for new snapshots, plain tar for legacy ones) |
 | changes | `POST changes {title, body?, base, head, mergePolicy?}`, `GET changes?state=`, `GET/PATCH changes/:n`, `POST changes/:n/merge`, `GET changes/:n/mergeability`, `GET changes/:n/checks` |
 | checks and CI | `GET commits/:sha/status`, `POST check-runs`, `PATCH check-runs/:id`, `POST ci/jobs/claim`, `POST ci/jobs/:id/heartbeat`, `POST ci/jobs/:id/report` (`ci` scope) |
 | merge queue | `POST/DELETE changes/:n/enqueue`, `GET queue`, `GET train` |
@@ -258,6 +258,7 @@ The README's "Deploy from zero" and "Redeploy an existing deployment" sections a
 
 - Artifacts `repo.pushed` events reach the `kvarm-events` queue through one account-level subscription. For each message, one ingest D1 batch records the event, advances `pushed_at` monotonically, moves the ref position only for a newer event and refreshes the heads of open changes on that branch. Each downstream effect (cache invalidation, snapshot build, `kvarm/guard`, CI dispatch, Nexus index, train kicks) runs and is recorded independently, so a redelivery runs only what is missing. Out-of-order pushes cannot roll state back; a genuine repeated transition (A→B→A→B) is still processed.
 - Snapshots are addressed by commit: per-commit metadata points at an immutable per-tree tarball in R2, so commits with identical trees share bytes. `SnapshotBuilder` walks the tree in bounded Workflow steps. Reading metadata never starts a build.
+- New tarballs are gzip-compressed at build time under a `.tar.gz` key (`CompressionStream('gzip')` at the runtime's default level; one gzip member per Workflow step, because compressor state cannot cross steps). The format lives in the tree row's `r2_key`, so no migration was needed and a tree already built as `.tar` keeps its object, which is never relabelled or rewritten. Download serves whichever object the row names: `application/gzip` with a `.tar.gz` filename (no `Content-Encoding`, so `fetch` and `curl` return the stored bytes and `content-length` matches them) or, for legacy snapshots, `application/x-tar`; `x-kvarm-snapshot-format` names the form. The edge cache key includes the format, so a gzip and a plain entry for one commit never answer for each other. `size` in snapshot metadata is the stored (compressed) size. The CLI detects gzip by its magic bytes, applies every extraction check to the decompressed stream and refuses output past 8 GiB or a 1000:1 ratio.
 - Kvarm never deletes repository refs, user code or history automatically; an explicit abandon deletes only its workspace ref. Growing lists are paginated, comparisons and output are bounded, and runners poll with backoff.
 
 ### 11.6 Human and agent surfaces

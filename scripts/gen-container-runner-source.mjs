@@ -15,7 +15,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-export const RUNNER_MODULES = ['runner.js', 'checkout.js', 'workdir.js', 'git.js', 'http.js', 'untar.js'];
+export const RUNNER_MODULES = ['runner.js', 'checkout.js', 'workdir.js', 'git.js', 'http.js', 'untar.js', 'archive.js'];
 const root = new URL('..', import.meta.url);
 export const OUTPUT = fileURLToPath(new URL('apps/platform/src/containers/runnerSource.ts', root));
 

@@ -5,7 +5,8 @@
  * is concealed (404) from then on.
  *
  *   GET  snapshots/:ref            metadata: 200 ready, 202 building/absent, 409 failed, 404 unknown
- *   GET  snapshots/:ref/download   the tarball: a repo-scoped Cache API hit for the commit
+ *   GET  snapshots/:ref/download   the tarball (gzip for new snapshots, plain tar for legacy
+ *                                  ones; see tarResponse): a repo-scoped Cache API hit for the commit
  *                                  (no snapshot row, no R2), else streamed from R2 (one
  *                                  class-B read) and stored in the cache in step
  *   POST snapshots/:ref            explicit demand (checkout/CI): builds a missing snapshot
@@ -20,6 +21,7 @@ import { actorJson, authorizeRoute, denyJson, type App } from '../api';
 import { withLazyRepo } from '../../artifacts/repo';
 import { matchSnapshot, streamAndStore } from '../../cache/snapshot';
 import type { RepoRow } from '../../db/repos';
+import { FORMAT_HTTP, formatOfKey, type SnapshotFormat } from '../../snapshotFormat';
 import { isFullSha, type ResolveContext } from '../../services/refs';
 import {
   RefStoreUnavailable,
@@ -84,7 +86,7 @@ snapshotsApi.get('/repos/:owner/:repo/snapshots/*', async (c) => {
     if (!sha) return notFound(c);
     if (parsed.download) {
       const cached = await matchSnapshot(repo.id, sha);
-      if (cached) return tarResponse(c, repo, sha, cached.tree, cached.size, cached.body);
+      if (cached) return tarResponse(c, repo, sha, cached.tree, cached.size, cached.format, cached.body);
     }
     const row = await readSnapshot(c.env, repo.id, sha);
     if (!row && isFullSha(parsed.ref) && !(await commitExists(ctx, sha))) return notFound(c);
@@ -100,24 +102,36 @@ snapshotsApi.get('/repos/:owner/:repo/snapshots/*', async (c) => {
     const object = await c.env.SNAPSHOTS.get(row.r2_key);
     if (!object) return c.json({ error: 'snapshot bytes missing', code: 'SNAPSHOT_MISSING', sha }, 409);
     const tree = row.tree ?? sha;
-    const body = streamAndStore(c.executionCtx, repo.id, sha, tree, object);
-    return tarResponse(c, repo, sha, tree, object.size, body);
+    const format = formatOfKey(row.r2_key);
+    const body = streamAndStore(c.executionCtx, repo.id, sha, tree, object, format);
+    return tarResponse(c, repo, sha, tree, object.size, format, body);
   });
 });
 
+/**
+ * A gzip snapshot is served as the archive it is (`application/gzip`, a
+ * `.tar.gz` filename) with no Content-Encoding: that header would make fetch
+ * and `curl --compressed` silently unwrap it and leave `content-length`
+ * describing bytes the client never sees. Legacy uncompressed snapshots keep
+ * `application/x-tar`. `x-kvarm-snapshot-format` names the form; the CLI
+ * relies on the gzip magic bytes, not on any header.
+ */
 function tarResponse(
   c: Context<App>,
   repo: RepoRow,
   sha: string,
   tree: string,
   size: number,
+  format: SnapshotFormat,
   body: ReadableStream<Uint8Array>,
 ): Response {
+  const http = FORMAT_HTTP[format];
   const res = new Response(body, {
     headers: {
-      'content-type': 'application/x-tar',
+      'content-type': http.contentType,
       'content-length': String(size),
-      'content-disposition': `attachment; filename="${repo.name}-${sha.slice(0, 12)}.tar"`,
+      'content-disposition': `attachment; filename="${repo.name}-${sha.slice(0, 12)}.${http.extension}"`,
+      'x-kvarm-snapshot-format': format,
       etag: `"${tree}"`,
       'cache-control': 'no-store',
       'x-kvarm-snapshot-sha': sha,

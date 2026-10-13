@@ -10,11 +10,12 @@
 
 import { env as cfEnv } from 'cloudflare:workers';
 import { createExecutionContext, createMessageBatch, getQueueResult, waitOnExecutionContext } from 'cloudflare:test';
+import { gunzipSync } from 'node:zlib';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mintPAT, type Scope } from '../src/auth/pat';
 import { COST_HEADER, parseCostHeader, type CostCounters } from '../src/cost/meter';
 import { snapshotInstanceId } from '../src/services/events';
-import { matchSnapshot, streamAndStore } from '../src/cache/snapshot';
+import { matchSnapshot, snapshotCacheKey, streamAndStore } from '../src/cache/snapshot';
 import {
   BLOBS_PER_STEP,
   READ_AHEAD,
@@ -193,10 +194,45 @@ async function objectKeys(repoId: string): Promise<string[]> {
   return list.objects.map((o) => o.key);
 }
 
-async function tarball(repoId: string, tree: string): Promise<Uint8Array> {
-  const obj = await env.SNAPSHOTS.get(snapshotKey(repoId, tree));
+/** The object as stored in R2: gzip for every snapshot built now. */
+async function storedTarball(repoId: string, tree: string, key = snapshotKey(repoId, tree)): Promise<Uint8Array> {
+  const obj = await env.SNAPSHOTS.get(key);
   expect(obj).not.toBeNull();
   return new Uint8Array(await obj!.arrayBuffer());
+}
+
+/** Multi-member aware: the builder writes one gzip member per step, and DecompressionStream rejects that. */
+async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(gunzipSync(bytes));
+}
+
+/** The tar inside the stored gzip object. */
+async function tarball(repoId: string, tree: string): Promise<Uint8Array> {
+  return gunzip(await storedTarball(repoId, tree));
+}
+
+/**
+ * Turns a freshly built snapshot into what an earlier release left behind: the
+ * plain tar under the `.tar` key, with the tree row pointing at it.
+ */
+async function downgradeToLegacy(repoId: string, tree: string): Promise<string> {
+  const legacyKey = snapshotKey(repoId, tree, 'tar');
+  const plain = await tarball(repoId, tree);
+  await env.SNAPSHOTS.put(legacyKey, plain, { httpMetadata: { contentType: 'application/x-tar' } });
+  await env.SNAPSHOTS.delete(snapshotKey(repoId, tree));
+  await env.DB.prepare('UPDATE snapshot_trees SET r2_key = ?, size = ? WHERE repo_id = ? AND tree = ?')
+    .bind(legacyKey, plain.length, repoId, tree)
+    .run();
+  return legacyKey;
+}
+
+/** Text that gzip cannot shrink much, so size-driven multipart behavior still happens. */
+function noise(length: number): string {
+  const raw = new Uint8Array(Math.ceil((length * 3) / 4));
+  for (let off = 0; off < raw.length; off += 65536) crypto.getRandomValues(raw.subarray(off, off + 65536));
+  let text = '';
+  for (let off = 0; off < raw.length; off += 32768) text += btoa(String.fromCharCode(...raw.subarray(off, off + 32768)));
+  return text.slice(0, length);
 }
 
 /** What a checkout of `files` contains: every file, symlink and (implied) directory. */
@@ -287,14 +323,18 @@ function expectStoredMatchesLogs(cost: BuildCost, logs: StepLog[]): void {
 }
 
 /** F files of `size` bytes in 10 directories. */
-function manyFiles(count: number, size: number, salt = ''): Files {
+function manyFiles(count: number, size: number, salt = '', incompressible = false): Files {
   const files: Files = {};
   for (let i = 0; i < count; i++) {
     const head = `file ${i}${salt}\n`;
-    files[`d${i % 10}/f${String(i).padStart(5, '0')}.txt`] = head + 'x'.repeat(Math.max(0, size - head.length - 1)) + '\n';
+    const fill = Math.max(0, size - head.length - 1);
+    files[`d${i % 10}/f${String(i).padStart(5, '0')}.txt`] = head + (incompressible ? noise(fill) : 'x'.repeat(fill)) + '\n';
   }
   return files;
 }
+
+/** R2's minimum part size: lets a few MB of incompressible data span several parts. */
+const SMALL_PARTS = { partSize: 5 * 1024 * 1024 };
 
 beforeAll(async () => {
   tok.owner = (await mintPAT(env, await seedUser(OWNER), 'owner', FULL)).token;
@@ -319,8 +359,8 @@ describe('SnapshotBuilder', () => {
     });
     expect(out?.outcome).toBe('built');
     expect(runner.steps).toEqual(['resolve', 'batch-1', 'finish']);
-    const bytes = await tarball(id, c.tree);
-    checkTar(readTar(bytes), SMALL);
+    const bytes = await storedTarball(id, c.tree);
+    checkTar(readTar(await gunzip(bytes)), SMALL);
 
     const row = await commitRow(id, c.sha);
     expect(row).toMatchObject({ state: 'ready', tree: c.tree, reused: 0 });
@@ -341,35 +381,78 @@ describe('SnapshotBuilder', () => {
     expect(tree).toEqual({ size: bytes.length, files: 6 });
   });
 
+  it('stores a new snapshot gzip-compressed under a .tar.gz key, smaller than the tar it holds', async () => {
+    const { id, repo } = await seedRepo('gz');
+    const files = manyFiles(40, 6000, 'gz');
+    const c = await commit(repo, files);
+    await buildSnapshot(env, { repoId: id, sha: c.sha, instanceId: 'snap-gz' }, new Runner());
+    expect(await objectKeys(id)).toEqual([`trees/v1/${id}/${c.tree}.tar.gz`]);
+    const stored = await storedTarball(id, c.tree);
+    expect([stored[0], stored[1]]).toEqual([0x1f, 0x8b]);
+    const tar = await gunzip(stored);
+    checkTar(readTar(tar), files);
+    expect(stored.length).toBeLessThan(tar.length / 5);
+    const head = await env.SNAPSHOTS.head(snapshotKey(id, c.tree));
+    expect(head?.httpMetadata?.contentType).toBe('application/gzip');
+    expect(head?.customMetadata).toEqual({ format: 'tar+gzip' });
+    const tree = await env.DB.prepare('SELECT r2_key, size FROM snapshot_trees WHERE repo_id = ? AND tree = ?')
+      .bind(id, c.tree)
+      .first<{ r2_key: string; size: number }>();
+    expect(tree).toEqual({ r2_key: snapshotKey(id, c.tree), size: stored.length });
+  });
+
+  it('rebuilding a failed legacy tree writes the gzip key and points the row at it', async () => {
+    const { id, repo } = await seedRepo('gz-rebuild');
+    const c = await commit(repo, SMALL);
+    const legacyKey = snapshotKey(id, c.tree, 'tar');
+    await env.DB.prepare(
+      `INSERT INTO snapshot_trees (repo_id, tree, state, builder, r2_key, created_at, error) VALUES (?, ?, 'failed', 'old', ?, ?, 'boom')`,
+    )
+      .bind(id, c.tree, legacyKey, Date.now())
+      .run();
+    await buildSnapshot(env, { repoId: id, sha: c.sha, instanceId: 'snap-gz-rebuild' }, new Runner());
+    const row = await env.DB.prepare('SELECT state, r2_key FROM snapshot_trees WHERE repo_id = ? AND tree = ?')
+      .bind(id, c.tree)
+      .first<{ state: string; r2_key: string }>();
+    expect(row).toEqual({ state: 'ready', r2_key: snapshotKey(id, c.tree) });
+    expect(await objectKeys(id)).toEqual([snapshotKey(id, c.tree)]);
+  });
+
   it(`batches about ${BLOBS_PER_STEP} blobs per step and streams multipart parts (steps <= ceil(F/500)+2)`, async () => {
     const { id, repo } = await seedRepo('many');
-    const files = manyFiles(1001, 9000);
+    const files = manyFiles(1001, 9000, '', true);
     const c = await commit(repo, files);
     const runner = new Runner();
-    await buildSnapshot(env, { repoId: id, sha: c.sha, instanceId: 'snap-many' }, runner);
+    await buildSnapshot(env, { repoId: id, sha: c.sha, instanceId: 'snap-many' }, runner, SMALL_PARTS);
     expect(runner.steps).toEqual(['resolve', 'batch-1', 'batch-2', 'batch-3', 'finish']);
     const cost = JSON.parse((await commitRow(id, c.sha))!.build_cost!) as BuildCost;
     expect(cost.steps).toBe(5);
     expect(cost.steps).toBeLessThanOrEqual(Math.ceil(1001 / 500) + 2);
     expect(cost.blobReads).toBe(1001);
-    // ~9.3 MB: one full 8 MiB part plus the tail, written as one object.
+    // ~9.3 MB of base64 noise gzips to ~7 MB: parts are cut from the compressed
+    // output (one full 5 MiB part plus the tail), carried across three steps
+    // and three gzip members, written as one object.
+    const bytes = await storedTarball(id, c.tree);
+    expect(cost.bytes).toBe(bytes.length);
+    expect(bytes.length).toBeGreaterThan(SMALL_PARTS.partSize);
+    expect(cost.parts).toBe(Math.ceil(bytes.length / SMALL_PARTS.partSize));
     expect(cost.parts).toBe(2);
     expect(cost.objects).toBe(1);
     expect(cost.r2a).toBe(1 + 2 + 1);
-    const bytes = await tarball(id, c.tree);
-    expect(cost.bytes).toBe(bytes.length);
-    checkTar(readTar(bytes), files);
+    checkTar(readTar(await gunzip(bytes)), files);
   });
 
   it('retries an interrupted batch from its persisted input and still writes a correct tar', async () => {
     const { id, repo } = await seedRepo('retry');
-    const files = manyFiles(1001, 9000, '-retry');
+    const files = manyFiles(1001, 9000, '-retry', true);
     const c = await commit(repo, files);
     // A blob in the second batch fails once, after that step already uploaded a part.
     const victim = Object.keys(files).sort()[900]!;
     repo.failBlobOnce.add(await blobHash(files[victim] as string));
     const runner = new Runner(2);
-    const logs = await builderLogs('snap-retry', () => buildSnapshot(env, { repoId: id, sha: c.sha, instanceId: 'snap-retry' }, runner));
+    const logs = await builderLogs('snap-retry', () =>
+      buildSnapshot(env, { repoId: id, sha: c.sha, instanceId: 'snap-retry' }, runner, SMALL_PARTS),
+    );
     expect(runner.attempts.filter((s) => s.startsWith('batch-')).length).toBe(4);
     expect(runner.steps).toEqual(['resolve', 'batch-1', 'batch-2', 'batch-3', 'finish']);
     checkTar(readTar(await tarball(id, c.tree)), files);
@@ -389,9 +472,8 @@ describe('SnapshotBuilder', () => {
   it('streams each blob into parts within the read-ahead byte budget, no whole-blob copies, complete tar', async () => {
     const { id, repo } = await seedRepo('stream');
     const partSize = 5 * 1024 * 1024; // the R2 minimum part size
-    const files = manyFiles(20, 300 * 1024, '-stream');
-    const bigLine = 'large blob line 0123456789abcdef\n';
-    files['big/large.txt'] = bigLine.repeat(Math.ceil((12 * 1024 * 1024) / bigLine.length));
+    const files = manyFiles(20, 300 * 1024, '-stream', true);
+    files['big/large.txt'] = noise(12 * 1024 * 1024);
     files['big/link'] = { content: 'large.txt', mode: '120000' };
     const c = await commit(repo, files);
     const runner = new Runner();
@@ -402,13 +484,14 @@ describe('SnapshotBuilder', () => {
     expect(repo.maxOpenBlobs).toBeLessThanOrEqual(READ_AHEAD);
     expect(repo.maxOpenBytes).toBeLessThanOrEqual(READ_BUDGET);
     expect(repo.materialized).toBe(0);
-    const bytes = await tarball(id, c.tree);
-    checkTar(readTar(bytes), files);
+    const bytes = await storedTarball(id, c.tree);
+    checkTar(readTar(await gunzip(bytes)), files);
     const cost = JSON.parse((await commitRow(id, c.sha))!.build_cost!) as BuildCost;
     expect(cost.bytes).toBe(bytes.length);
     expect(cost.parts).toBe(Math.ceil(bytes.length / partSize));
+    expect(cost.parts).toBeGreaterThan(2);
     expect(cost.largestBlob).toBe((files['big/large.txt'] as string).length);
-    // Unflushed tar bytes never exceed one part plus one stream chunk and a header.
+    // Unflushed (compressed) bytes never exceed one part plus one compressor output chunk.
     expect(cost.peakBuffer).toBeLessThan(partSize + FAKE_STREAM_CHUNK + 2048);
     expect(cost.peakHeld).toBeGreaterThanOrEqual(repo.maxOpenBytes);
     expect(cost.peakHeld).toBeLessThanOrEqual(READ_BUDGET);
@@ -798,12 +881,88 @@ describe('snapshot API', () => {
 
     const dl = await call(snap('api', 'agents/w1/download'), { token: tok.owner });
     expect(dl.status).toBe(200);
-    expect(dl.headers.get('content-type')).toBe('application/x-tar');
+    // A new snapshot is a gzip archive served as such: no Content-Encoding, so
+    // fetch and curl hand over the stored bytes and content-length matches them.
+    expect(dl.headers.get('content-type')).toBe('application/gzip');
+    expect(dl.headers.get('content-encoding')).toBeNull();
+    expect(dl.headers.get('x-kvarm-snapshot-format')).toBe('gzip');
+    expect(dl.headers.get('content-disposition')).toBe(`attachment; filename="api-${fx.feature.sha.slice(0, 12)}.tar.gz"`);
     expect(dl.cost).toMatchObject({ r2b: 1, r2a: 0, art: 0, do: 0 });
     expect(dl.cost.d1).toBeLessThanOrEqual(2);
     expect(dl.bytes.length).toBe(warm.json.size);
     expect(Number(dl.headers.get('content-length'))).toBe(warm.json.size);
-    checkTar(readTar(dl.bytes), { ...SMALL, 'feature.txt': 'feature\n' });
+    expect([dl.bytes[0], dl.bytes[1]]).toEqual([0x1f, 0x8b]);
+    checkTar(readTar(await gunzip(dl.bytes)), { ...SMALL, 'feature.txt': 'feature\n' });
+  });
+
+  it('a legacy uncompressed snapshot still downloads (x-tar, same cost) and extracts; its object is never relabelled', async () => {
+    const { id, repo } = await seedRepo('legacy');
+    const files: Files = { ...SMALL, ...manyFiles(30, 12_000, 'legacy') };
+    const c = await commit(repo, files);
+    repo.refs.set('refs/heads/main', c.sha);
+    await call(snap('legacy', 'main'), { method: 'POST', token: tok.owner });
+    await builder.drain();
+    const legacyKey = await downgradeToLegacy(id, c.tree);
+
+    const meta = await call(snap('legacy', 'main'), { token: tok.owner });
+    expect(meta.status).toBe(200);
+    const first = await call(snap('legacy', `${c.sha}/download`), { token: tok.owner });
+    expect(first.status).toBe(200);
+    expect(first.headers.get('content-type')).toBe('application/x-tar');
+    expect(first.headers.get('x-kvarm-snapshot-format')).toBe('tar');
+    expect(first.headers.get('content-disposition')).toBe(`attachment; filename="legacy-${c.sha.slice(0, 12)}.tar"`);
+    expect(first.cost).toMatchObject({ r2b: 1, r2a: 0, art: 0, do: 0, sub: 0, cache: 'miss' });
+    expect(first.cost.d1).toBeLessThanOrEqual(2);
+    expect(first.bytes.length).toBe(meta.json.size);
+    expect(Number(first.headers.get('content-length'))).toBe(meta.json.size);
+    checkTar(readTar(first.bytes), files);
+
+    const second = await call(snap('legacy', `${c.sha}/download`), { token: tok.owner });
+    expect(second.cost).toMatchObject({ r2b: 0, cache: 'hit' });
+    expect(second.cost.d1).toBe(1);
+    expect(second.bytes).toEqual(first.bytes);
+    expect(second.headers.get('content-type')).toBe('application/x-tar');
+    expect(second.headers.get('x-kvarm-snapshot-format')).toBe('tar');
+
+    // A later commit with the same tree reuses the legacy object: no gzip twin appears.
+    const later = await commit(repo, files, [c.sha]);
+    repo.refs.set('refs/heads/main', later.sha);
+    await call(snap('legacy', 'main'), { method: 'POST', token: tok.owner });
+    await builder.drain();
+    expect(await commitRow(id, later.sha)).toMatchObject({ state: 'ready', reused: 1 });
+    expect(await objectKeys(id)).toEqual([legacyKey]);
+    const reused = await call(snap('legacy', `${later.sha}/download`), { token: tok.owner });
+    expect(reused.headers.get('content-type')).toBe('application/x-tar');
+    expect(reused.bytes).toEqual(first.bytes);
+  });
+
+  it('a gzip and a plain entry for the same repo and commit never answer for each other in the cache', async () => {
+    const repoId = crypto.randomUUID();
+    const sha = 'e'.repeat(40);
+    const plainBytes = new Uint8Array(4096).fill(7);
+    const gzipBytes = new Uint8Array(2048).fill(9);
+    const store = async (bytes: Uint8Array, format: 'tar' | 'gzip', tree: string) => {
+      const ctx = createExecutionContext();
+      const body = new Blob([bytes as Uint8Array<ArrayBuffer>]).stream();
+      await new Response(streamAndStore(ctx, repoId, sha, tree, { body, size: bytes.length } as unknown as R2ObjectBody, format)).arrayBuffer();
+      await waitOnExecutionContext(ctx);
+    };
+    expect(snapshotCacheKey(repoId, sha, 'gzip').url).not.toBe(snapshotCacheKey(repoId, sha, 'tar').url);
+
+    await store(plainBytes, 'tar', 't'.repeat(40));
+    const plainOnly = await matchSnapshot(repoId, sha);
+    expect(plainOnly).toMatchObject({ format: 'tar', size: plainBytes.length });
+    expect(new Uint8Array(await new Response(plainOnly!.body).arrayBuffer())).toEqual(plainBytes);
+
+    await store(gzipBytes, 'gzip', 'g'.repeat(40));
+    const both = await matchSnapshot(repoId, sha);
+    expect(both).toMatchObject({ format: 'gzip', size: gzipBytes.length, tree: 'g'.repeat(40) });
+    expect(new Uint8Array(await new Response(both!.body).arrayBuffer())).toEqual(gzipBytes);
+    // The plain entry is still intact under its own key.
+    const plainHit = await caches.default.match(snapshotCacheKey(repoId, sha, 'tar'));
+    expect(new Uint8Array(await plainHit!.arrayBuffer())).toEqual(plainBytes);
+    const gzipOnly = await matchSnapshot(repoId, 'f'.repeat(40));
+    expect(gzipOnly).toBeNull();
   });
 
   it('a failed build reports 409 and a new demand retries it', async () => {
@@ -909,7 +1068,7 @@ describe('snapshot API', () => {
   it('a repeat download of a ready commit is served from the repo-scoped cache: same bytes and etag, r2b=0, d1=1', async () => {
     const { repo } = await seedRepo('dlcache');
     // Several hundred kilobytes, so the tarball streams in many chunks on the miss.
-    const files: Files = { ...SMALL, ...manyFiles(30, 12_000, 'dl') };
+    const files: Files = { ...SMALL, ...manyFiles(30, 20_000, 'dl', true) };
     const c = await commit(repo, files);
     repo.refs.set('refs/heads/main', c.sha);
     await call(snap('dlcache', 'main'), { method: 'POST', token: tok.owner });
@@ -924,7 +1083,7 @@ describe('snapshot API', () => {
     expect(first.bytes.length).toBe(meta.json.size);
     expect(Number(first.headers.get('content-length'))).toBe(meta.json.size);
     expect(first.bytes.length).toBeGreaterThan(300_000);
-    checkTar(readTar(first.bytes), files);
+    checkTar(readTar(await gunzip(first.bytes)), files);
 
     const second = await call(snap('dlcache', `${c.sha}/download`), { token: tok.owner });
     expect(second.status).toBe(200);
@@ -932,7 +1091,7 @@ describe('snapshot API', () => {
     expect(second.cost.d1).toBe(1);
     expect(second.bytes).toEqual(first.bytes);
     expect(second.headers.get('etag')).toBe(`"${c.tree}"`);
-    for (const h of ['content-type', 'content-length', 'content-disposition', 'etag', 'cache-control', 'x-kvarm-snapshot-sha']) {
+    for (const h of ['content-type', 'content-length', 'content-disposition', 'etag', 'cache-control', 'x-kvarm-snapshot-sha', 'x-kvarm-snapshot-format']) {
       expect(second.headers.get(h), h).toBe(first.headers.get(h));
     }
     expect(second.headers.get('cache-control')).toContain('no-store');
@@ -947,7 +1106,7 @@ describe('snapshot API', () => {
     await env.DB.prepare("UPDATE repos SET name = 'dlcache-renamed' WHERE name = 'dlcache' AND owner_login = ?").bind(OWNER).run();
     const renamed = await call(snap('dlcache-renamed', `${c.sha}/download`), { token: tok.owner });
     expect(renamed.cost).toMatchObject({ r2b: 0, cache: 'hit' });
-    expect(renamed.headers.get('content-disposition')).toBe(`attachment; filename="dlcache-renamed-${c.sha.slice(0, 12)}.tar"`);
+    expect(renamed.headers.get('content-disposition')).toBe(`attachment; filename="dlcache-renamed-${c.sha.slice(0, 12)}.tar.gz"`);
     expect(renamed.bytes).toEqual(first.bytes);
   });
 
@@ -964,7 +1123,7 @@ describe('snapshot API', () => {
     const repoId = crypto.randomUUID();
     const sha = 'c'.repeat(40);
     const ctx = createExecutionContext();
-    const client = streamAndStore(ctx, repoId, sha, 'd'.repeat(40), { body, size } as unknown as R2ObjectBody);
+    const client = streamAndStore(ctx, repoId, sha, 'd'.repeat(40), { body, size } as unknown as R2ObjectBody, 'tar');
     const reader = client.getReader();
     expect((await reader.read()).value?.length).toBeGreaterThan(0);
     await reader.cancel();
