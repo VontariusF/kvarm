@@ -21,17 +21,17 @@ export interface StageOutcome extends StageResult {
   error?: string;
 }
 
-/** The Worker's 6-hour cron trigger: run the sweeps and log the per-stage outcome (a failure is logged, never thrown). */
+/** The Worker's 6-hour cron trigger: run the sweeps and log the per-stage outcome (runFleetSweeps never throws). */
 export async function runFleetCron(env: Env): Promise<void> {
-  try {
-    const stages = await runFleetSweeps(env);
-    const summary = Object.fromEntries(
-      stages.map((s) => [s.stage, s.ok ? { count: s.count, failed: s.failed } : { error: s.error }]),
-    );
-    console.log(JSON.stringify({ cron: 'fleet', ok: stages.every((s) => s.ok && s.failed === 0), stages: summary }));
-  } catch (err) {
-    console.log(JSON.stringify({ cron: 'fleet', error: String(err).slice(0, 200) }));
-  }
+  const stages = await runFleetSweeps(env);
+  const summary = Object.fromEntries(
+    stages.map((s) => [s.stage, s.ok ? { count: s.count, failed: s.failed } : { error: s.error }]),
+  );
+  const ok = stages.every((s) => s.ok && s.failed === 0);
+  // An error-level line is what a Worker log alert watches; a clean run stays at info.
+  const line = JSON.stringify({ cron: 'fleet', ok, stages: summary });
+  if (ok) console.log(line);
+  else console.error(line);
 }
 
 /**
@@ -65,8 +65,8 @@ async function eachRow(
 ): Promise<StageResult> {
   let failed = 0;
   for (const row of rows) {
-    const error = await act(row.id).catch((err: unknown) => String(err).slice(0, 200));
-    if (error) {
+    const error = await act(row.id).catch((err: unknown) => String(err).slice(0, 200) || 'threw');
+    if (error !== null) {
       failed++;
       console.warn(JSON.stringify({ fleetSweep: stage, [idKey]: row.id, error }));
     }
@@ -81,14 +81,15 @@ async function rebuildStage(env: Env, rows: { id: string }[], reason: 'age' | 'r
   });
 }
 
-/** A missing provider or a failure-shaped result is a refusal; the sandbox was not changed. */
+/** A failure-shaped provider result is a refusal and counts as failed; a missing provider fails the stage. */
 async function sandboxStage(env: Env, stage: 'discard' | 'sleep', rows: { id: string }[]): Promise<StageResult> {
+  // Resolved once: with no provider the stage fails as a whole instead of warning per row.
+  const provider = rows.length ? sandboxProvider('linux') : null;
+  if (rows.length && !provider) throw new Error('no linux sandbox provider');
   return eachRow(stage, 'sandboxId', rows, async (id) => {
-    const provider = sandboxProvider('linux');
-    if (!provider) return 'no linux sandbox provider';
-    const result: unknown = await provider.agentSandbox(env, id)[stage]();
+    const result: unknown = await provider!.agentSandbox(env, id)[stage]();
     if (result && typeof result === 'object' && 'ok' in result && result.ok === false) {
-      return (result as { error?: string }).error ?? 'refused';
+      return (result as { error?: string }).error || 'refused';
     }
     return null;
   });

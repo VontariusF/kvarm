@@ -396,6 +396,7 @@ describe('fleet services', () => {
       expect(await env.DB.prepare('SELECT status FROM sandboxes WHERE id = ?').bind(first).first()).toMatchObject({ status: 'sleeping' });
       expect(await env.DB.prepare('SELECT status FROM sandboxes WHERE id = ?').bind(next).first()).toMatchObject({ status: 'stopped' });
       expect(warn.mock.calls.map((c) => JSON.parse(String(c[0])))).toContainEqual({ fleetSweep: 'discard', sandboxId: first, error: 'Error: container gone' });
+      await env.DB.prepare('DELETE FROM sandboxes WHERE id = ?').bind(first).run();
     } finally {
       warn.mockRestore();
       log.mockRestore();
