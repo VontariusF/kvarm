@@ -1,6 +1,6 @@
 import { env as cfEnv } from 'cloudflare:workers';
 import { createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
-import { beforeAll, afterAll, describe, expect, it } from 'vitest';
+import { beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
 import { mintPAT, type Scope } from '../src/auth/pat';
 import { newSessionPayload, sessionCookie, type SessionPayload } from '../src/auth/workos';
 import { toUserRow } from '../src/db/users';
@@ -22,7 +22,7 @@ import {
   type SandboxContext,
 } from '../src/services/sandboxes';
 import { SANDBOX_PROVIDERS, type SandboxProvider } from '../src/services/sandboxes/provider';
-import { runFleetSweeps } from '../src/services/sandboxes/sweeps';
+import { FLEET_SWEEP_STAGES, runFleetCron, runFleetSweeps, type SweepStage } from '../src/services/sandboxes/sweeps';
 import { promoteBuild } from '../src/workflows/environmentBuild';
 import { getRepoById } from '../src/db/repos';
 import worker from '../src/index';
@@ -351,6 +351,34 @@ describe('fleet services', () => {
     expect(humanList.ok && humanList.value.sandboxes.map((sandbox) => sandbox.id)).toContain(otherSandbox);
     const agentList = await listMySandboxes(env, actor);
     expect(agentList.ok && agentList.value.sandboxes.every((sandbox) => sandbox.agentId === agentId)).toBe(true);
+  });
+
+  it('keeps sweeping later stages when the first stage throws, and logs the failure', async () => {
+    const agentId = await seedAgent(owner, `isolate-${crypto.randomUUID()}`);
+    const environment = await seedEnvironment({ ready: true });
+    const workspace = await seedWorkspace(agentId);
+    const expired = await seedSandbox({ agentId, environmentId: environment.id, buildId: environment.buildId!, workspaceId: workspace.id, status: 'sleeping', expiresAt: Date.now() - 1 });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const broken: SweepStage = { name: 'age', run: async () => { throw new Error('D1 down'); } };
+      const stages = [broken, ...FLEET_SWEEP_STAGES.slice(1)];
+      const outcomes = await runFleetSweeps(env, stages);
+      expect(outcomes.map((o) => [o.stage, o.ok])).toEqual([['age', false], ['retry', true], ['discard', true], ['sleep', true]]);
+      expect(outcomes[0]!.error).toContain('D1 down');
+      expect(outcomes.find((o) => o.stage === 'discard')!.count).toBeGreaterThanOrEqual(1);
+      expect(await env.DB.prepare('SELECT status FROM sandboxes WHERE id = ?').bind(expired).first()).toMatchObject({ status: 'stopped' });
+      expect(warn.mock.calls.map((c) => JSON.parse(String(c[0])))).toContainEqual({ fleetSweep: 'age', error: 'Error: D1 down' });
+      // The cron line carries each stage's outcome and counts.
+      const second = await seedSandbox({ agentId, environmentId: environment.id, buildId: environment.buildId!, workspaceId: workspace.id, status: 'sleeping', expiresAt: Date.now() - 1 });
+      await runFleetCron(env);
+      const line = log.mock.calls.map((c) => JSON.parse(String(c[0]))).find((l) => l.cron === 'fleet');
+      expect(line).toMatchObject({ ok: true, stages: { age: { failed: 0 }, retry: { failed: 0 }, discard: { count: 1, failed: 0 }, sleep: { count: 0, failed: 0 } } });
+      expect(await env.DB.prepare('SELECT status FROM sandboxes WHERE id = ?').bind(second).first()).toMatchObject({ status: 'stopped' });
+    } finally {
+      warn.mockRestore();
+      log.mockRestore();
+    }
   });
 
   it('applies deny and approval policy before execution and rejects a different owner', async () => {
