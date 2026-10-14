@@ -13,6 +13,7 @@ import { newSessionPayload, sessionCookie, type SessionPayload } from '../src/au
 import { toUserRow } from '../src/db/users';
 import worker, { platformRoutes } from '../src/index';
 import { CSRF_REFUSED, csrfExempt, sessionCsrf } from '../src/routes/pageCsrf';
+import { mintAgentToken } from '../src/services/agents';
 import { fakeArtifacts } from './helpers/fakeArtifacts';
 
 const ORIGIN = 'https://kvarm.test';
@@ -212,6 +213,159 @@ describe('page CSRF middleware: every page route (architecture §11.1)', () => {
         });
       }
     }
+  });
+});
+
+describe('page CSRF middleware: evasion attempts (architecture §11.1)', () => {
+  const settings = `/${OWNER}/${REPO}/settings`;
+  const refusedOrUnrouted = (res: { status: number }) => res.status === 403 || res.status === 404 || res.status === 405;
+
+  it('refuses tokenless session writes whatever the method spelling or override hint', async () => {
+    const before = await dbFingerprint();
+    const body = urlencoded({ description: 'override' });
+    for (const method of ['post', 'patch', 'Put', 'delete', 'PROPFIND']) {
+      const res = await browser(settings, { method, ...body });
+      expect({ method, ok: refusedOrUnrouted(res) }).toEqual({ method, ok: true });
+    }
+    for (const override of ['x-http-method-override', 'x-http-method', 'x-method-override']) {
+      const res = await browser(settings, { method: 'POST', ...body, headers: { ...body.headers, [override]: 'GET' } });
+      expect(res).toEqual({ status: 403, text: CSRF_REFUSED });
+    }
+    expect(await browser(settings, { method: 'POST', ...urlencoded({ _method: 'GET', description: 'override' }) })).toEqual({ status: 403, text: CSRF_REFUSED });
+    for (const method of ['HEAD', 'OPTIONS']) expect((await browser(settings, { method })).text).not.toBe(CSRF_REFUSED);
+    expect(await dbFingerprint()).toBe(before);
+  });
+
+  it('refuses tokenless session writes on paths that only look exempt or are spelled differently', async () => {
+    const before = await dbFingerprint();
+    for (const path of [
+      `/api/v1/../${OWNER}/${REPO}/settings`,
+      `/mcp/../${OWNER}/${REPO}/settings`,
+      `/auth/logout/../../${OWNER}/${REPO}/settings`,
+      `/%63srf-owner/${REPO}/settings`,
+      `/${OWNER}/${REPO}/%73ettings`,
+      `/${OWNER}/${REPO}/settings/`,
+      `/${OWNER.toUpperCase()}/${REPO}/settings`,
+      `/${OWNER}/${REPO}/settings?_csrf=${payload.csrf}`,
+      '/api/v1x',
+      '/%61pi/v1x',
+      '/auth/logout/',
+      '/mcp/',
+    ]) {
+      const res = await browser(path, { method: 'POST', ...urlencoded({ description: 'path trick', name: 'path-trick' }) });
+      expect({ path, res }).toEqual({ path, res: { status: 403, text: CSRF_REFUSED } });
+    }
+    expect(await dbFingerprint()).toBe(before);
+  });
+
+  it('decodes the exempt prefix the way the router does: an encoded /api/v1 reaches the REST API, never a page', async () => {
+    const res = await browser(`/%61pi/v1/repos/${OWNER}/${REPO}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(res.text).not.toBe(CSRF_REFUSED);
+    expect(res.status).toBe(200);
+  });
+
+  it('accepts only a string token in the form body: not a file part, the query string or a non-form body', async () => {
+    const before = await dbFingerprint();
+    const file = new FormData();
+    file.append('_csrf', new File([payload.csrf], 'token.txt', { type: 'text/plain' }));
+    file.append('description', 'file token');
+    expect(await browser(settings, { method: 'POST', body: file })).toEqual({ status: 403, text: CSRF_REFUSED });
+    expect(
+      await browser(`${settings}?_csrf=${payload.csrf}`, { method: 'POST', ...urlencoded({ description: 'query token' }) }),
+    ).toEqual({ status: 403, text: CSRF_REFUSED });
+    expect(
+      await browser(settings, { method: 'POST', headers: { 'content-type': 'text/plain' }, body: `_csrf=${payload.csrf}&description=plain` }),
+    ).toEqual({ status: 403, text: CSRF_REFUSED });
+    const empty = await browser(settings, { method: 'POST', ...urlencoded({ _csrf: '', description: 'empty token' }) });
+    expect(empty).toEqual({ status: 403, text: CSRF_REFUSED });
+    expect(await dbFingerprint()).toBe(before);
+  });
+
+  it('accepts a real form whatever the content-type parameters or case', async () => {
+    const res = await browser(settings, {
+      method: 'POST',
+      headers: { 'content-type': 'Application/X-WWW-Form-Urlencoded; charset=UTF-8' },
+      body: new URLSearchParams({ _csrf: payload.csrf, description: 'charset form' }).toString(),
+    });
+    expect(res.status).toBe(302);
+  });
+
+  it('counts the session over a bearer token from the same origin, so the token is still required', async () => {
+    const res = await browser(settings, {
+      method: 'POST',
+      ...urlencoded({ description: 'session plus bearer' }),
+      headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: `Bearer ${strangerPat}` },
+    });
+    expect(res).toEqual({ status: 403, text: CSRF_REFUSED });
+  });
+
+  it('requires the token from a session whose browser omits Origin unless Fetch Metadata says cross-site', async () => {
+    const before = await dbFingerprint();
+    const bare = (headers: Record<string, string>) =>
+      send(settings, { method: 'POST', headers: { cookie, 'content-type': 'application/x-www-form-urlencoded', ...headers }, body: 'description=bare' });
+    for (const site of [undefined, 'same-origin', 'none']) {
+      const res = await bare(site === undefined ? {} : { 'sec-fetch-site': site });
+      expect({ site, res }).toEqual({ site, res: { status: 403, text: CSRF_REFUSED } });
+    }
+    // Not the session (requestCredential): anonymous on a private repository, so concealed.
+    for (const headers of [{ 'sec-fetch-site': 'same-site' }, { 'sec-fetch-site': 'cross-site' }, { origin: 'null' }] as Record<string, string>[]) {
+      expect((await bare(headers)).status).toBe(404);
+    }
+    expect(await dbFingerprint()).toBe(before);
+  });
+
+  it('passes an agent token without _csrf to the handler', async () => {
+    const owner = await env.DB.prepare('SELECT * FROM users WHERE login = ?').bind(OWNER).first<Parameters<typeof toUserRow>[0]>();
+    const minted = await mintAgentToken(env, { user: toUserRow(owner!), via: 'session', scopes: null }, agentId, {
+      repo: `${OWNER}/${REPO}`,
+      role: 'read',
+      refs: null,
+      expiresIn: 3600,
+      name: null,
+    });
+    expect(minted.ok).toBe(true);
+    if (!minted.ok) return;
+    const res = await send(settings, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${minted.value.token}`, 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'description=agent',
+    });
+    expect(res.text).not.toBe(CSRF_REFUSED);
+  });
+
+  it('treats a revoked session cookie as no session: no token demanded, nothing written, the cookie cleared', async () => {
+    const owner = await env.DB.prepare('SELECT id FROM users WHERE login = ?').bind(OWNER).first<{ id: string }>();
+    const revoked = await signedIn(owner!.id);
+    await env.DB.prepare('INSERT INTO session_revocations (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)')
+      .bind(revoked.jti, owner!.id, revoked.exp, Date.now())
+      .run();
+    const before = await dbFingerprint();
+    const ctx = createExecutionContext();
+    const res = await worker.fetch!(
+      new Request(`${ORIGIN}${settings}`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { cookie: (await sessionCookie(env, revoked)).split(';')[0]!, origin: ORIGIN, 'content-type': 'application/x-www-form-urlencoded' },
+        body: `_csrf=${revoked.csrf}&description=revoked`,
+      }) as Request<unknown, IncomingRequestCfProperties>,
+      env,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(404);
+    expect(res.headers.getSetCookie().some((line) => /Max-Age=0/.test(line))).toBe(true);
+    expect(await dbFingerprint()).toBe(before);
+  });
+
+  // MCP is bearer-only (mcp/server.ts); a browser that also sends its session cookie is not held to the form token.
+  it('leaves a same-origin MCP call that also carries the session cookie to the JSON surface', async () => {
+    const res = await browser('/mcp', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${strangerPat}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    expect(res.text).not.toBe(CSRF_REFUSED);
+    expect(res.status).toBeLessThan(400);
   });
 });
 

@@ -484,6 +484,23 @@ describe('session lifecycle', () => {
     expect(setCookieNamed(res, SESSION_COOKIE)).toBeDefined();
   });
 
+  // The page CSRF middleware resolves the session first; its refusal must still
+  // hand the browser the rotated refresh token, which is single-use.
+  it('keeps the refreshed cookie on a page post the CSRF middleware refuses', async () => {
+    const user = await sessionUser();
+    const jar = await craft(user, { rat: Date.now() - 1 });
+    const before = jar.get(SESSION_COOKIE);
+    fake.calls = [];
+    const res = await post('/settings/tokens', jar, { name: 'no-token', scopes: 'read' });
+    expect(res.status).toBe(403);
+    expect(fake.calls).toEqual([{ grant: 'refresh_token' }]);
+    expect(setCookieNamed(res, SESSION_COOKIE)).toMatch(/HttpOnly; Secure; SameSite=Lax$/);
+    expect(jar.get(SESSION_COOKIE)).not.toBe(before);
+    const minted = await post('/settings/tokens', jar, { _csrf: await csrfOf(jar), name: 'after-refresh', scopes: 'read' });
+    expect(minted.status).toBe(201);
+    expect(fake.calls.length).toBe(1);
+  });
+
   it('signs out when WorkOS refuses the refresh or answers for someone else', async () => {
     const user = await sessionUser();
     fake.revokedUsers.add(user.workos_user_id);
