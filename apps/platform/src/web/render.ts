@@ -124,6 +124,8 @@ export async function appLayout(env: Env, opts: AppLayoutOptions, body: string):
   const login = opts.userLogin ?? '';
   let needsYouCount = opts.needsYouCount ?? 0;
   let runningCount = opts.runningCount ?? 0;
+  // Changes waiting for review join sandbox approvals: both need this human (services/inboxCount.ts).
+  const inboxRead = opts.inboxCount !== undefined ? Promise.resolve(opts.inboxCount) : opts.userId ? cachedInboxCount(opts.userId) : Promise.resolve(null);
   if (opts.userId && (opts.needsYouCount === undefined || opts.runningCount === undefined)) {
     const counts = await env.DB.prepare(
       `SELECT
@@ -138,12 +140,13 @@ export async function appLayout(env: Env, opts: AppLayoutOptions, body: string):
     if (opts.runningCount === undefined) runningCount = Number(counts?.running ?? 0);
     if (opts.needsYouCount === undefined) needsYouCount = Number(counts?.approvals ?? 0);
   }
-  // Changes waiting for review join sandbox approvals: both need this human (services/inboxCount.ts).
-  const inbox = opts.inboxCount !== undefined ? opts.inboxCount : opts.userId ? await cachedInboxCount(opts.userId) : null;
+  const inbox = await inboxRead;
   const inboxWaiting = inbox?.count ?? 0;
-  const badge = `${needsYouCount + inboxWaiting}${inbox?.more ? '+' : ''}`;
+  // `more` qualifies a counted page; with nothing counted it says nothing.
+  const plus = inboxWaiting > 0 && inbox?.more ? '+' : '';
+  const badge = `${needsYouCount + inboxWaiting}${plus}`;
   const badgeHref = inboxWaiting > 0 ? '/inbox' : '/fleet#approvals';
-  const badgeTitle = `${inboxWaiting}${inbox?.more ? '+' : ''} change(s) to review · ${needsYouCount} sandbox approval(s)`;
+  const badgeTitle = `${inboxWaiting}${plus} change(s) to review · ${needsYouCount} sandbox approval(s)`;
   const repos = opts.repos ?? [];
   const repoLinks = repos
     .map(

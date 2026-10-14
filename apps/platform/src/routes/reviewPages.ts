@@ -134,10 +134,16 @@ function noteField(id: string, label: string): string {
     </div>`;
 }
 
-function reviewForm(owner: string, name: string, n: number, headSha: string | null, csrf: string, back: 'inbox' | 'change', idBase: string): string {
+/** The inbox page a decide form came from, so a failed decision returns to the same page. */
+function cursorField(cursor: string | null): string {
+  return cursor ? html`<input type="hidden" name="cursor" value="${cursor}" />` : '';
+}
+
+function reviewForm(owner: string, name: string, n: number, headSha: string | null, csrf: string, back: 'inbox' | 'change', idBase: string, cursor: string | null = null): string {
   return html`
     <form class="k-decide-form" method="post" action="${raw(`${changeHref(owner, name, n)}/review`)}">
       ${raw(csrf)}
+      ${raw(cursorField(cursor))}
       <input type="hidden" name="headSha" value="${headSha ?? ''}" />
       <input type="hidden" name="back" value="${back}" />
       ${raw(noteField(`${idBase}-review`, `Review note for ${short(headSha)}`))}
@@ -148,10 +154,11 @@ function reviewForm(owner: string, name: string, n: number, headSha: string | nu
     </form>`;
 }
 
-function resolveForm(owner: string, name: string, n: number, e: EscalationView, csrf: string, back: 'inbox' | 'change', idBase: string): string {
+function resolveForm(owner: string, name: string, n: number, e: EscalationView, csrf: string, back: 'inbox' | 'change', idBase: string, cursor: string | null = null): string {
   return html`
     <form class="k-decide-form" method="post" action="${raw(`${changeHref(owner, name, n)}/escalations/${encodeURIComponent(e.id)}/resolve`)}">
       ${raw(csrf)}
+      ${raw(cursorField(cursor))}
       <input type="hidden" name="back" value="${back}" />
       ${raw(noteField(`${idBase}-${e.id}`, `Resolution note: ${REASON_LABEL[e.reason]}`))}
       <div class="actions">
@@ -184,7 +191,7 @@ function mayResolve(authorPrincipal: string | null, viewerId: string): boolean {
   return authorPrincipal !== `user:${viewerId}`;
 }
 
-function inboxItem(item: InboxItem, csrf: string, viewerId: string, error: string | null): string {
+function inboxItem(item: InboxItem, csrf: string, viewerId: string, error: string | null, cursor: string | null): string {
   const { owner, name } = item.repo;
   const idBase = itemKey(owner, name, item.number);
   const escalation = item.reasons[0] !== 'approvals-required';
@@ -223,8 +230,8 @@ function inboxItem(item: InboxItem, csrf: string, viewerId: string, error: strin
           <summary class="btn btn-sm">Decide</summary>
           <div class="k-decide-body">
             ${raw(error ? errorNote(error) : '')}
-            ${raw(mayResolve(item.author.principal, viewerId) ? item.openEscalations.map((e) => resolveForm(owner, name, item.number, e, csrf, 'inbox', idBase)).join('') : '')}
-            ${raw(reviewForm(owner, name, item.number, item.headSha, csrf, 'inbox', idBase))}
+            ${raw(mayResolve(item.author.principal, viewerId) ? item.openEscalations.map((e) => resolveForm(owner, name, item.number, e, csrf, 'inbox', idBase, cursor)).join('') : '')}
+            ${raw(reviewForm(owner, name, item.number, item.headSha, csrf, 'inbox', idBase, cursor))}
           </div>
         </details>
       </div>
@@ -252,10 +259,13 @@ inboxPages.get('/', async (c) => {
   const failedItem = c.req.query('error') ? (c.req.query('item') ?? null) : null;
   const shown = new Set(inbox.groups.flatMap((g) => g.items.map((i) => itemKey(i.repo.owner, i.repo.name, i.number))));
   const inline = failedItem !== null && shown.has(failedItem);
-  const firstPage = !c.req.query('cursor');
-  const inboxCount = firstPage ? { count: inbox.counts.changes, more: inbox.nextCursor !== null } : undefined;
-  // The header badge on other pages reads this count back (services/inboxCount.ts).
-  if (inboxCount) c.executionCtx.waitUntil(rememberInboxCount(actor.user.id, inboxCount));
+  const failedError = inline ? (c.req.query('error') ?? null) : null;
+  const cursor = c.req.query('cursor') ?? null;
+  // Only the default first page is the count the badge means; a custom `limit` would count something else.
+  const inboxCount = !cursor && !c.req.query('limit') ? { count: inbox.counts.changes, more: inbox.nextCursor !== null } : undefined;
+  // The header badge on other pages reads this count back (services/inboxCount.ts). Awaited, so a decision
+  // posted after this page loaded clears it rather than racing a late write.
+  if (inboxCount) await rememberInboxCount(actor.user.id, inboxCount);
   const waiting = inbox.counts.changes;
   const head = pageHead(
     'INBOX · NEEDS A HUMAN',
@@ -279,7 +289,7 @@ inboxPages.get('/', async (c) => {
       <section class="panel" aria-labelledby="g-${g.reason}">
         <div class="panel-head"><h2 class="hud k-panel-title" id="g-${g.reason}">${REASON_LABEL[g.reason]} · <b>${g.items.length}</b></h2></div>
         <p class="k-group-help">${REASON_HELP[g.reason]}</p>
-        ${raw(g.items.map((i) => inboxItem(i, csrf, actor.user.id, inline && itemKey(i.repo.owner, i.repo.name, i.number) === failedItem ? (c.req.query('error') ?? null) : null)).join(''))}
+        ${raw(g.items.map((i) => inboxItem(i, csrf, actor.user.id, itemKey(i.repo.owner, i.repo.name, i.number) === failedItem ? failedError : null, cursor)).join(''))}
       </section>`,
     )
     .join('');
@@ -373,7 +383,7 @@ function principalName(packet: ReviewPacket, principal: string | null): string |
   const r = packet.reviews.find((x) => x.principal === principal);
   if (r) return reviewer(r);
   if (packet.author.principal === principal) return packet.author.agent?.name ?? packet.author.login;
-  return principal.startsWith('agent:') ? 'an agent' : 'a reviewer';
+  return principal.startsWith('agent:') ? `agent ${principal.slice('agent:'.length)}` : 'a reviewer';
 }
 
 function escalationBlock(owner: string, name: string, packet: ReviewPacket, e: EscalationView, csrf: string, canDecide: boolean): string {
@@ -383,7 +393,7 @@ function escalationBlock(owner: string, name: string, packet: ReviewPacket, e: E
     <div class="k-inbox-item ${open ? 'heat' : 'quiet'}">
       <div class="k-inbox-body">
         <span class="hud">${REASON_LABEL[e.reason]} · ${e.state} · opened ${timeAgo(Date.parse(e.openedAt))}${by ? ` by ${by}` : ''}</span>
-        <p>${REASON_HELP[e.reason]}</p>
+        ${raw(open ? html`<p>${REASON_HELP[e.reason]}</p>` : '')}
         ${raw(!open ? html`<p class="k-inbox-quiet">${e.resolution ?? 'resolved'} by ${e.resolvedBy ?? 'unknown'}${e.note ? raw(html`: ${e.note}`) : ''}</p>` : '')}
         ${raw(open && canDecide ? resolveForm(owner, name, packet.number, e, csrf, 'change', `e`) : '')}
       </div>
@@ -539,7 +549,8 @@ function afterDecision(
   const query = `error=${encodeURIComponent(outcome.error)}`;
   if (form.back === 'inbox') {
     const key = itemKey(repo.owner_login, repo.name, n);
-    return c.redirect(`/inbox?${query}&item=${encodeURIComponent(key)}#${key}`, 303);
+    const page = typeof form.cursor === 'string' && form.cursor.length > 0 && form.cursor.length <= 200 ? `&cursor=${encodeURIComponent(form.cursor)}` : '';
+    return c.redirect(`/inbox?${query}${page}&item=${encodeURIComponent(key)}#${key}`, 303);
   }
   return c.redirect(`${changeHref(repo.owner_login, repo.name, n)}?${query}#${panel}`, 303);
 }

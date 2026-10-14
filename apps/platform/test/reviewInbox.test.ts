@@ -370,6 +370,9 @@ describe('deciding from the page', () => {
     // Another app page reads the remembered count back, with no inbox query of its own.
     const change = await call(`/${OWNER}/beta/changes/1`, tok.owner);
     expect(badge(change.text)?.slice(1)).toEqual(['/inbox', n]);
+    // A custom page size counts something else and is not remembered.
+    await call('/inbox?limit=1', tok.owner);
+    expect(badge((await call(`/${OWNER}/beta/changes/1`, tok.owner)).text)?.slice(1)).toEqual(['/inbox', n]);
   });
 
   it('returns a failed inbox decision to its item, panel open, error beside it', async () => {
@@ -384,6 +387,9 @@ describe('deciding from the page', () => {
     expect(item).toMatch(/role="alert">Add a note/);
     // Shown once, next to the item, not again at the top of the page.
     expect(page.text.split('role="alert"').length).toBe(2);
+    // From a later inbox page, the redirect keeps that page.
+    const later = await call(`/${OWNER}/alpha/changes/2/review`, tok.owner, form({ verdict: 'approve', note: '', back: 'inbox', cursor: 'abc' }));
+    expect(later.location).toBe(`/inbox?error=NOTE_REQUIRED&cursor=abc&item=${encodeURIComponent(key)}#${key}`);
   });
 
   it('requires a note and writes nothing without one', async () => {
@@ -448,6 +454,8 @@ describe('deciding from the page', () => {
     expect(esc).toEqual({ state: 'resolved', resolution: 'resolve', note: 'boreas is right; atlas reworks the quotes', resolved_by_login: OWNER });
     const decision = await env.DB.prepare("SELECT chosen_candidate FROM agent_decisions WHERE repo_id = ? AND task_id = 'change:1'").bind(repoIds.alpha).first<{ chosen_candidate: string }>();
     expect(decision?.chosen_candidate).toBe('resolve:reviewer-disagreement');
+    // A settled escalation no longer tells the reader to act on it.
+    expect((await call(`/${OWNER}/alpha/changes/1`, tok.owner)).text).not.toContain('One reviewer approved the head another asked to change.');
     const again = await call(`/${OWNER}/alpha/changes/1/escalations/${ids.escalation}/resolve`, tok.owner, form({ resolution: 'resolve', note: 'twice', back: 'change' }));
     expect(again.location).toBe(`/${OWNER}/alpha/changes/1?error=ESCALATION_RESOLVED#escalations`);
   });
