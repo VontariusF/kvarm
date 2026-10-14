@@ -14,6 +14,7 @@ import { toUserRow } from '../src/db/users';
 import worker, { platformRoutes } from '../src/index';
 import { CSRF_REFUSED, csrfExempt, sessionCsrf } from '../src/routes/pageCsrf';
 import { mintAgentToken } from '../src/services/agents';
+import { RESERVED_LOGINS } from '../src/services/orgs';
 import { fakeArtifacts } from './helpers/fakeArtifacts';
 
 const ORIGIN = 'https://kvarm.test';
@@ -153,6 +154,12 @@ describe('page CSRF middleware: every page route (architecture §11.1)', () => {
     expect(exempt).toContain('/mcp');
     for (const path of exempt) expect(path === '/mcp' || path === '/auth/logout' || path.startsWith('/api/v1/'), path).toBe(true);
     for (const near of ['/api/v1x', '/api', '/auth/logout/', '/auth/logoutx', '/mcp/', '/x/api/v1/repos']) expect(csrfExempt(near), near).toBe(false);
+  });
+
+  // The exemption is by path, so a /:owner/:repo page whose owner were `api`,
+  // `mcp` or `auth` would skip the middleware; only reserved logins prevent that.
+  it('exempts no path an account can own', () => {
+    for (const login of ['api', 'mcp', 'auth']) expect(RESERVED_LOGINS.has(login), login).toBe(true);
   });
 
   it('finds the page routers’ form posts', () => {
@@ -460,6 +467,14 @@ describe('page CSRF middleware: bodies and credentials (architecture §11.1)', (
     for (const path of ['/no-such-page', `/${OWNER}/${REPO}/no-such-page`]) {
       expect((await browser(path, { method: 'POST', ...urlencoded({ _csrf: payload.csrf }) })).status, path).toBe(404);
     }
+  });
+
+  it('answers a tokened post to a static asset as the assets binding answers any post, body already read or not', async () => {
+    const anonymous = await send('/favicon.ico', { method: 'POST', ...urlencoded({ pad: 'x'.repeat(5000) }) });
+    for (const init of [{ method: 'POST', ...urlencoded({ _csrf: payload.csrf, pad: 'x'.repeat(5000) }) }, { method: 'POST', ...multipart({ _csrf: payload.csrf }) }]) {
+      expect((await browser('/favicon.ico', init)).status).toBe(anonymous.status);
+    }
+    expect(anonymous.status).toBe(405);
   });
 
   it('refuses before the handler runs: an unknown repository answers 403, not the handler’s 404', async () => {
