@@ -187,7 +187,7 @@ export async function appLayout(env: Env, opts: AppLayoutOptions, body: string):
     <div class="k-ws"><i>${initial}</i><span>${login || 'Account'}</span></div>
   </div>
   <div class="k-right">
-    <a class="k-needs" href="${raw(badgeHref)}" title="${badgeTitle}"><span>Needs you</span><b>${badge}</b></a>
+    <a class="k-needs" href="${raw(badgeHref)}" title="${badgeTitle}" aria-label="Needs you: ${badge}"><span>Needs you</span><b>${badge}</b></a>
     <div class="mode" role="group" aria-label="Show this app for">
       <button type="button" data-mode-set="human" aria-pressed="true"><svg aria-hidden="true"><use href="#g-node"/></svg>Human</button>
       <button type="button" data-mode-set="agent" aria-pressed="false"><svg aria-hidden="true"><use href="#g-x"/></svg>Agent</button>
