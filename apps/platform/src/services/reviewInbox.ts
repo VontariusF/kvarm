@@ -25,15 +25,20 @@ import { authorizeRepo, type Actor } from './authz';
 import type { ChangeContext } from './changes';
 import { changeDecisionTask, recordDecision, type DecisionView } from './decisions';
 import type { EscalationReason } from './reviewGate';
-import { getReviewPacket, inboxCondition, pendingAcross, REVIEW_LIMITS, resolveEscalation, submitReview, type PendingChange, type ReviewVerdict } from './reviews';
+import { getReviewPacket, LIVE_FOR_REVIEW, pendingAcross, REVIEW_LIMITS, resolveEscalation, submitReview, type PendingChange, type ReviewVerdict } from './reviews';
 
 export const INBOX_LIMITS = {
   /** Repositories considered for one inbox read. */
   reposMax: 100,
   changesDefault: 25,
   changesMax: 50,
-  /** Candidate pages one inbox read scans to fill a page (candidates the gate does not block are skipped). */
-  scanRounds: 4,
+  /**
+   * Live changes one inbox read examines, newest first, to fill a page (the gate decides each; ones it does
+   * not hold are skipped). At most this many rows per repository are read through idx_cs_live_created.
+   */
+  scanWindow: 100,
+  /** The instance admin's most recently pushed repositories considered beyond their own roles. */
+  adminReposWindow: 500,
   /** The note every page decision requires (the review body and the decision's reason). */
   noteMax: REVIEW_LIMITS.noteMax,
 };
@@ -102,26 +107,40 @@ export function groupInbox(items: InboxItem[]): InboxGroup[] {
 }
 
 /**
- * Repositories the actor may review that hold a change waiting for a human
- * (the inbox candidate condition), newest push first. The candidate filter only narrows the read; `authorizeRepo` decides.
+ * Repositories the actor may review that hold a live change, newest push
+ * first. The candidate filter only narrows the read; `authorizeRepo` decides.
  */
 async function reviewableRepos(env: Env, actor: Actor): Promise<{ repos: RepoRow[]; truncated: boolean }> {
-  const { results } = await env.DB.prepare(
-    `SELECT r.*, ?1 AS facts_user_id,
-            (SELECT m.role FROM org_members m WHERE m.org_id = r.owner_org_id AND m.user_id = ?1) AS facts_org_role,
-            (SELECT g.role FROM repo_grants g WHERE g.repo_id = r.id AND g.user_id = ?1) AS facts_grant
-       FROM repos r
-      WHERE (?3 = 1
-             OR (r.owner_org_id IS NULL AND r.owner_login = ?2)
-             OR EXISTS (SELECT 1 FROM org_members m WHERE m.org_id = r.owner_org_id AND m.user_id = ?1 AND m.role IN ('owner', 'maintainer'))
-             OR EXISTS (SELECT 1 FROM repo_grants g WHERE g.repo_id = r.id AND g.user_id = ?1 AND g.role IN ('write', 'admin')))
-        AND EXISTS (SELECT 1 FROM change_sets c WHERE c.repo_id = r.id AND ${inboxCondition('c')})
-      ORDER BY COALESCE(r.pushed_at, r.created_at) DESC, r.id
-      LIMIT ?4`,
-  )
-    .bind(actor.user.id, actor.user.login, actor.user.is_admin === true ? 1 : 0, INBOX_LIMITS.reposMax + 1)
-    .all<RepoFactsRow>();
-  const rows = results ?? [];
+  const db = env.DB;
+  const admin = actor.user.is_admin === true;
+  // Each source is an index probe from the viewer (idx_repos_owner, idx_repos_owner_org, idx_repo_grants_user),
+  // so the read follows the viewer's own authority rather than the size of the instance. The instance admin
+  // also gets the most recently pushed repositories (idx_repos_pushed), a fixed window of them.
+  const candidates = db
+    .prepare(
+      `WITH mine(id) AS (
+         SELECT r.id FROM repos r WHERE r.owner_login = ?2 AND r.owner_org_id IS NULL
+         UNION SELECT r.id FROM org_members m JOIN repos r ON r.owner_org_id = m.org_id WHERE m.user_id = ?1 AND m.role IN ('owner', 'maintainer')
+         UNION SELECT g.repo_id FROM repo_grants g WHERE g.user_id = ?1 AND g.role IN ('write', 'admin')
+         UNION SELECT id FROM (SELECT r.id FROM repos r WHERE ?3 = 1 ORDER BY r.pushed_at DESC LIMIT ${INBOX_LIMITS.adminReposWindow})
+       )
+       SELECT r.*, ?1 AS facts_user_id,
+              (SELECT m.role FROM org_members m WHERE m.org_id = r.owner_org_id AND m.user_id = ?1) AS facts_org_role,
+              (SELECT g.role FROM repo_grants g WHERE g.repo_id = r.id AND g.user_id = ?1) AS facts_grant
+         FROM repos r
+        WHERE r.id IN (SELECT id FROM mine)
+          AND EXISTS (SELECT 1 FROM change_sets c WHERE c.repo_id = r.id AND ${LIVE_FOR_REVIEW('c')})
+        ORDER BY COALESCE(r.pushed_at, r.created_at) DESC, r.id
+        LIMIT ?4`,
+    )
+    .bind(actor.user.id, actor.user.login, admin ? 1 : 0, INBOX_LIMITS.reposMax + 1);
+  // Only the instance admin's window can leave repositories unscanned; one probe in the same round trip says so.
+  const [res, probe] = await db.batch<RepoFactsRow | { n: number }>([
+    candidates,
+    ...(admin ? [db.prepare(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM repos LIMIT ${INBOX_LIMITS.adminReposWindow + 1})`)] : []),
+  ]);
+  const rows = (res?.results ?? []) as RepoFactsRow[];
+  const windowFull = admin && ((probe?.results?.[0] as { n: number } | undefined)?.n ?? 0) > INBOX_LIMITS.adminReposWindow;
   const repos: RepoRow[] = [];
   for (const row of rows.slice(0, INBOX_LIMITS.reposMax)) {
     const { repo, facts } = splitFacts(row);
@@ -129,7 +148,7 @@ async function reviewableRepos(env: Env, actor: Actor): Promise<{ repos: RepoRow
     const d = await authorizeRepo(env, repo, actor, 'write', 'page', facts);
     if (d.ok) repos.push(d.repo);
   }
-  return { repos, truncated: rows.length > INBOX_LIMITS.reposMax };
+  return { repos, truncated: rows.length > INBOX_LIMITS.reposMax || windowFull };
 }
 
 /** GET /inbox: one page of pending changes across the repositories the actor may review. */
@@ -150,16 +169,10 @@ export async function reviewInbox(env: Env, actor: Actor, q: { limit?: string; c
   const { repos, truncated } = await reviewableRepos(env, actor);
   const byId = new Map(repos.map((r) => [r.id, r]));
   const repoIds = [...byId.keys()];
-  const changes: PendingChange[] = [];
-  let cursor = after;
-  let more = false;
-  for (let round = 0; round < INBOX_LIMITS.scanRounds && changes.length < limit; round++) {
-    const page = await pendingAcross(env, repoIds, { limit: limit - changes.length, after: cursor });
-    changes.push(...page.changes);
-    more = page.more;
-    cursor = page.last ?? cursor;
-    if (!page.more) break;
-  }
+  const page = await pendingAcross(env, repoIds, { limit, window: INBOX_LIMITS.scanWindow, after });
+  const changes = page.changes;
+  const more = page.more;
+  const cursor = page.last ?? after;
   const items: InboxItem[] = changes.map((c) => {
     const repo = byId.get(c.repoId)!;
     return { ...c, repo: { owner: repo.owner_login, name: repo.name }, reasons: inboxReasons(c) };

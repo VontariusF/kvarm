@@ -23,7 +23,7 @@ import type { RepoRow } from '../db/repos';
 import type { ServiceResult } from '../repos/service';
 import type { Actor } from './authz';
 import { modelFamilyEvidence, type EvidenceLevel } from './provenance';
-import { BRANCH_RULE_COLUMNS, effectivePolicy, ruleFromRow, type BranchRule, type BranchRuleRow } from './branchRules';
+import { BRANCH_RULE_COLUMNS, effectivePolicy, ruleFromRow, type BranchPolicy, type BranchRule, type BranchRuleRow } from './branchRules';
 import { autoMerge, branchRef, fail, guarded, parseNumber, readChange, type ChangeContext } from './changes';
 import {
   HUMAN_MODEL_FAMILY,
@@ -34,6 +34,7 @@ import {
   reviewGate,
   type EscalationReason,
   type ReviewBlocker,
+  type ReviewFacts,
   type ReviewFactsRow,
 } from './reviewGate';
 
@@ -822,18 +823,11 @@ function pendingCondition(c: string): string {
 }
 
 /**
- * A superset of the changes the review gate blocks on a human: pending as
- * above, or in a repository with branch rules (a human-approval requirement
- * or a protected-path escalation nobody recorded yet), or named as an arena
- * winner. The exact gate (`reviewGate` over the target's policy) then decides
- * per row in pendingAcross.
+ * A live change a review can still be wanted on. The terms are exactly the
+ * WHERE of the partial index idx_cs_live_created (migration 0036), so a probe
+ * by repository in `(created_at, id)` order reads only the rows it returns.
  */
-export function inboxCondition(c: string): string {
-  const f = reviewFactExpressions(c);
-  return `${c}.state IN ('open', 'conflicted') AND ${c}.merge_policy != 'draft'
-          AND (${f.openCount} > 0 OR ${f.approvals} < ${f.required}
-               OR EXISTS (SELECT 1 FROM branch_rules b WHERE b.repo_id = ${c}.repo_id) OR ${f.finalSelected})`;
-}
+export const LIVE_FOR_REVIEW = (c: string): string => `${c}.state IN ('open', 'conflicted') AND ${c}.merge_policy != 'draft'`;
 
 // ---------------------------------------------------------------------------
 // Pending reviews across repositories (the review inbox, services/reviewInbox.ts)
@@ -894,41 +888,76 @@ export function staleApprovals(reviews: readonly ReviewView[]): ReviewView[] {
 
 /**
  * Changes the review gate blocks on a human over the given repositories,
- * newest first, `(created_at, id)` keyset-paged over the candidate rows (a
- * page can hold fewer than `limit` changes when candidates turn out not to
- * be blocked). Callers authorize the repository ids first; nothing here
- * checks access. Two D1 round trips: the page, then one batch with each
- * listed change's newest reviews and open escalations (an index-ordered
- * LIMIT per change) and the repositories' branch rules.
+ * newest first, `(created_at, id)` keyset-paged. One read examines at most
+ * `window` live changes (each repository's newest through the partial index
+ * idx_cs_live_created, merged), computes the review facts for those rows only
+ * and keeps the first `limit` the gate holds; `last` is the row the next page
+ * starts after, and `more` says rows remain beyond it. A page can therefore
+ * hold fewer than `limit` changes, or none, while `more` is true. Callers
+ * authorize the repository ids first; nothing here checks access. Two D1
+ * round trips: the examined rows with the repositories' branch rules, then one
+ * batch with each kept change's newest reviews and open escalations (an
+ * index-ordered LIMIT per change).
  */
 export async function pendingAcross(
   env: Env,
   repoIds: readonly string[],
-  page: { limit: number; after: { at: number; id: string } | null },
+  page: { limit: number; window: number; after: { at: number; id: string } | null },
 ): Promise<{ changes: PendingChange[]; more: boolean; last: { at: number; id: string } | null }> {
   if (repoIds.length === 0) return { changes: [], more: false, last: null };
   const db = env.DB;
-  const { results } = await db
-    .prepare(
-      `SELECT c.id, c.repo_id, c.number, c.title, c.state, c.merge_policy, c.base_ref, c.head_sha, c.author_id, u.login AS author_login,
-              c.agent_meta, c.created_at,
-              (SELECT a.model_family FROM agents a WHERE a.id = json_extract(c.agent_meta, '$.agentId')) AS author_family,
-              ${reviewFactsColumns('c')}
-         FROM change_sets c LEFT JOIN users u ON u.id = c.author_id
-        WHERE c.repo_id IN (SELECT value FROM json_each(?1)) AND ${inboxCondition('c')}
-          AND (?2 IS NULL OR (c.created_at, c.id) < (?2, ?3))
-        ORDER BY c.created_at DESC, c.id DESC LIMIT ?4`,
-    )
-    .bind(JSON.stringify(repoIds), page.after?.at ?? null, page.after?.id ?? null, page.limit + 1)
-    .all<PendingAcrossRow>();
-  const rows = (results ?? []).slice(0, page.limit);
-  const more = (results ?? []).length > page.limit;
-  const lastRow = rows[rows.length - 1];
-  const last = lastRow ? { at: lastRow.created_at, id: lastRow.id } : null;
-  if (rows.length === 0) return { changes: [], more, last };
-  const ids = JSON.stringify(rows.map((r) => r.id));
-  const repos = JSON.stringify([...new Set(rows.map((r) => r.repo_id))]);
-  const [reviewRes, escalationRes, ruleRes] = await db.batch([
+  const window = Math.max(page.window, page.limit);
+  // Spelled as a range on created_at (not a row value or an OR with IS NULL) so each repository's probe seeks.
+  const after = page.after ? 'AND y.created_at <= ?2 AND (y.created_at < ?2 OR y.id < ?3)' : '';
+  const [candidateRes, ruleRes] = await db.batch([
+    db
+      .prepare(
+        `SELECT c.id, c.repo_id, c.number, c.title, c.state, c.merge_policy, c.base_ref, c.head_sha, c.author_id, u.login AS author_login,
+                c.agent_meta, c.created_at,
+                (SELECT a.model_family FROM agents a WHERE a.id = json_extract(c.agent_meta, '$.agentId')) AS author_family,
+                ${reviewFactsColumns('c')}
+           FROM change_sets c LEFT JOIN users u ON u.id = c.author_id
+          WHERE c.id IN (SELECT x.id FROM json_each(?1) j
+                           JOIN change_sets x ON x.id IN (SELECT y.id FROM change_sets y
+                                                           WHERE y.repo_id = j.value AND ${LIVE_FOR_REVIEW('y')} ${after}
+                                                           ORDER BY y.created_at DESC, y.id DESC LIMIT ?4)
+                          ORDER BY x.created_at DESC, x.id DESC LIMIT ?4)
+          ORDER BY c.created_at DESC, c.id DESC`,
+      )
+      .bind(JSON.stringify(repoIds), page.after?.at ?? null, page.after?.id ?? null, window + 1),
+    db
+      .prepare(
+        `SELECT b.repo_id, ${BRANCH_RULE_COLUMNS} FROM json_each(?1) j
+           JOIN branch_rules b ON b.id IN (SELECT x.id FROM branch_rules x WHERE x.repo_id = j.value LIMIT ${PENDING_ACROSS_LIMITS.rulesPerRepo})`,
+      )
+      .bind(JSON.stringify(repoIds)),
+  ]);
+  const all = (candidateRes?.results as PendingAcrossRow[] | undefined) ?? [];
+  const examined = all.slice(0, window);
+  let more = all.length > window;
+  const rulesOf = new Map<string, BranchRule[]>();
+  for (const r of (ruleRes?.results as Array<BranchRuleRow & { repo_id: string }> | undefined) ?? []) {
+    rulesOf.set(r.repo_id, [...(rulesOf.get(r.repo_id) ?? []), ruleFromRow(r)]);
+  }
+  const held: Array<{ row: PendingAcrossRow; facts: ReviewFacts; policy: BranchPolicy; gate: ReturnType<typeof reviewGate> }> = [];
+  let last: { at: number; id: string } | null = null;
+  for (let i = 0; i < examined.length; i++) {
+    const row = examined[i]!;
+    last = { at: row.created_at, id: row.id };
+    const facts = parseReviewFacts(row);
+    const policy = effectivePolicy(rulesOf.get(row.repo_id) ?? [], branchRef(row.base_ref));
+    const gate = reviewGate(facts, policy);
+    // Only what a human must answer: a change blocked by nothing (or by checks alone) is not inbox work.
+    if (gate.blockers.length === 0) continue;
+    held.push({ row, facts, policy, gate });
+    if (held.length === page.limit) {
+      more ||= i < examined.length - 1;
+      break;
+    }
+  }
+  if (held.length === 0) return { changes: [], more, last };
+  const ids = JSON.stringify(held.map((h) => h.row.id));
+  const [reviewRes, escalationRes] = await db.batch([
     db
       .prepare(
         `SELECT r.id, r.change_set_id, r.head_sha, r.principal, r.user_id, r.user_login, r.agent_id, r.agent_name, r.model_family, r.verdict,
@@ -947,12 +976,6 @@ export async function pendingAcross(
                                                  ORDER BY x.opened_at DESC LIMIT ${PENDING_ACROSS_LIMITS.escalationsPerChange})`,
       )
       .bind(ids),
-    db
-      .prepare(
-        `SELECT b.repo_id, ${BRANCH_RULE_COLUMNS} FROM json_each(?1) j
-           JOIN branch_rules b ON b.id IN (SELECT x.id FROM branch_rules x WHERE x.repo_id = j.value LIMIT ${PENDING_ACROSS_LIMITS.rulesPerRepo})`,
-      )
-      .bind(repos),
   ]);
   const group = <T extends { change_set_id: string }>(list: T[] | undefined): Map<string, T[]> => {
     const m = new Map<string, T[]>();
@@ -961,22 +984,12 @@ export async function pendingAcross(
   };
   const reviewsOf = group(reviewRes?.results as Array<ReviewRow & { change_set_id: string }> | undefined);
   const escalationsOf = group(escalationRes?.results as Array<EscalationRow & { change_set_id: string }> | undefined);
-  const rulesOf = new Map<string, BranchRule[]>();
-  for (const r of (ruleRes?.results as Array<BranchRuleRow & { repo_id: string }> | undefined) ?? []) {
-    rulesOf.set(r.repo_id, [...(rulesOf.get(r.repo_id) ?? []), ruleFromRow(r)]);
-  }
-  const changes: PendingChange[] = [];
-  for (const row of rows) {
-    const facts = parseReviewFacts(row);
-    const policy = effectivePolicy(rulesOf.get(row.repo_id) ?? [], branchRef(row.base_ref));
-    const gate = reviewGate(facts, policy);
-    // Only what a human must answer: a change blocked by nothing (or by checks alone) is not inbox work.
-    if (gate.blockers.length === 0) continue;
+  const changes: PendingChange[] = held.map(({ row, facts, policy, gate }) => {
     const author = authorView(row);
     const reviews = (reviewsOf.get(row.id) ?? [])
       .sort((a, b) => b.updated_at - a.updated_at || (a.id < b.id ? -1 : 1))
       .map((r) => reviewView(r, row.head_sha, author));
-    changes.push({
+    return {
       id: row.id,
       repoId: row.repo_id,
       number: row.number,
@@ -993,7 +1006,7 @@ export async function pendingAcross(
       staleApprovals: staleApprovals(reviews).length,
       createdAt: iso(row.created_at),
       createdAtMs: row.created_at,
-    });
-  }
+    };
+  });
   return { changes, more, last };
 }
