@@ -173,6 +173,8 @@ describe('page CSRF middleware: every page route (architecture §11.1)', () => {
       'POST /:owner/:repo/issues',
       'POST /:owner/:repo/arenas/:id/select',
       'POST /:owner/:repo/environments',
+      'POST /:owner/:repo/changes/:number/review',
+      'POST /:owner/:repo/changes/:number/escalations/:id/resolve',
     ]) {
       expect(paths).toContain(expected);
     }
