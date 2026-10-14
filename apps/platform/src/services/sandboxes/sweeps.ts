@@ -11,7 +11,7 @@ export interface StageResult {
 
 export interface SweepStage {
   name: string;
-  run: (env: Env, now: number) => Promise<StageResult>;
+  run: (env: Env) => Promise<StageResult>;
 }
 
 /** A stage's outcome as logged; `error` is set only when the stage itself threw. */
@@ -28,7 +28,7 @@ export async function runFleetCron(env: Env): Promise<void> {
     const summary = Object.fromEntries(
       stages.map((s) => [s.stage, s.ok ? { count: s.count, failed: s.failed } : { error: s.error }]),
     );
-    console.log(JSON.stringify({ cron: 'fleet', ok: stages.every((s) => s.ok), stages: summary }));
+    console.log(JSON.stringify({ cron: 'fleet', ok: stages.every((s) => s.ok && s.failed === 0), stages: summary }));
   } catch (err) {
     console.log(JSON.stringify({ cron: 'fleet', error: String(err).slice(0, 200) }));
   }
@@ -40,11 +40,10 @@ export async function runFleetCron(env: Env): Promise<void> {
  * `stages` is a seam for tests; production always uses FLEET_SWEEP_STAGES.
  */
 export async function runFleetSweeps(env: Env, stages: SweepStage[] = FLEET_SWEEP_STAGES): Promise<StageOutcome[]> {
-  const now = Date.now();
   const outcomes: StageOutcome[] = [];
   for (const stage of stages) {
     try {
-      outcomes.push({ stage: stage.name, ok: true, ...(await stage.run(env, now)) });
+      outcomes.push({ stage: stage.name, ok: true, ...(await stage.run(env)) });
     } catch (err) {
       const error = String(err).slice(0, 200);
       console.warn(JSON.stringify({ fleetSweep: stage.name, error }));
@@ -54,95 +53,100 @@ export async function runFleetSweeps(env: Env, stages: SweepStage[] = FLEET_SWEE
   return outcomes;
 }
 
-async function rebuildStage(env: Env, rows: { id: string }[], reason: 'age' | 'retry'): Promise<StageResult> {
+/**
+ * Applies `act` to each row on its own, so one row's throw or refusal counts
+ * as failed and logged, and the rest of the batch still runs.
+ */
+async function eachRow(
+  stage: string,
+  idKey: 'environmentId' | 'sandboxId',
+  rows: { id: string }[],
+  act: (id: string) => Promise<string | null>,
+): Promise<StageResult> {
   let failed = 0;
   for (const row of rows) {
-    const requested = await requestEnvironmentBuild(env, row.id, reason);
-    if (!requested.ok && requested.code !== 'BUILD_NOT_QUEUED') {
+    const error = await act(row.id).catch((err: unknown) => String(err).slice(0, 200));
+    if (error) {
       failed++;
-      console.warn(JSON.stringify({ fleetSweep: reason, environmentId: row.id, error: requested.error }));
+      console.warn(JSON.stringify({ fleetSweep: stage, [idKey]: row.id, error }));
     }
   }
   return { count: rows.length, failed };
 }
 
-/** Failure-shaped provider results are logged, not thrown, so the rest of the batch still runs. */
-function refused(result: unknown): string | null {
-  if (result && typeof result === 'object' && 'ok' in result && result.ok === false) {
-    return (result as { error?: string }).error ?? 'refused';
-  }
-  return null;
+async function rebuildStage(env: Env, rows: { id: string }[], reason: 'age' | 'retry'): Promise<StageResult> {
+  return eachRow(reason, 'environmentId', rows, async (id) => {
+    const requested = await requestEnvironmentBuild(env, id, reason);
+    return !requested.ok && requested.code !== 'BUILD_NOT_QUEUED' ? requested.error : null;
+  });
+}
+
+/** A missing provider or a failure-shaped result is a refusal; the sandbox was not changed. */
+async function sandboxStage(env: Env, stage: 'discard' | 'sleep', rows: { id: string }[]): Promise<StageResult> {
+  return eachRow(stage, 'sandboxId', rows, async (id) => {
+    const provider = sandboxProvider('linux');
+    if (!provider) return 'no linux sandbox provider';
+    const result: unknown = await provider.agentSandbox(env, id)[stage]();
+    if (result && typeof result === 'object' && 'ok' in result && result.ok === false) {
+      return (result as { error?: string }).error ?? 'refused';
+    }
+    return null;
+  });
 }
 
 export const FLEET_SWEEP_STAGES: SweepStage[] = [
   {
     name: 'age',
-    async run(env, now) {
+    async run(env) {
       const aged = await env.DB.prepare(
         `SELECT e.id FROM environments e JOIN environment_builds b ON b.id = e.ready_build_id
           WHERE e.archived_at IS NULL AND b.status = 'ready'
             AND b.created_at < ?1 - e.max_build_age_hours * 3600000
           ORDER BY b.created_at LIMIT ?2`,
       )
-        .bind(now, BATCH_SIZE)
+        .bind(Date.now(), BATCH_SIZE)
         .all<{ id: string }>();
       return rebuildStage(env, aged.results ?? [], 'age');
     },
   },
   {
     name: 'retry',
-    async run(env, now) {
+    async run(env) {
       const retry = await env.DB.prepare(
-        `SELECT e.id, b.attempt, b.finished_at FROM environments e
+        `SELECT e.id FROM environments e
           JOIN environment_builds b ON b.environment_id = e.id
           WHERE e.archived_at IS NULL AND b.status = 'failed'
             AND b.seq = (SELECT MAX(latest.seq) FROM environment_builds latest WHERE latest.environment_id = e.id)
             AND b.finished_at <= ?1 - CASE WHEN b.attempt >= 5 THEN 24 ELSE (1 << MIN(b.attempt, 4)) END * 3600000
           ORDER BY b.finished_at LIMIT ?2`,
       )
-        .bind(now, BATCH_SIZE)
-        .all<{ id: string; attempt: number }>();
+        .bind(Date.now(), BATCH_SIZE)
+        .all<{ id: string }>();
       return rebuildStage(env, retry.results ?? [], 'retry');
     },
   },
   {
     name: 'discard',
-    async run(env, now) {
+    async run(env) {
       const expired = await env.DB.prepare(
-        `SELECT * FROM sandboxes WHERE status IN ('starting','running','sleeping') AND expires_at <= ?1
+        `SELECT id FROM sandboxes WHERE status IN ('starting','running','sleeping') AND expires_at <= ?1
           ORDER BY expires_at LIMIT ?2`,
       )
-        .bind(now, BATCH_SIZE)
-        .all<{ id: string; status: string; token_id: string | null }>();
-      let failed = 0;
-      for (const row of expired.results ?? []) {
-        const error = refused(await sandboxProvider('linux')?.agentSandbox(env, row.id).discard());
-        if (error) {
-          failed++;
-          console.warn(JSON.stringify({ fleetSweep: 'discard', sandboxId: row.id, error }));
-        }
-      }
-      return { count: expired.results?.length ?? 0, failed };
+        .bind(Date.now(), BATCH_SIZE)
+        .all<{ id: string }>();
+      return sandboxStage(env, 'discard', expired.results ?? []);
     },
   },
   {
     name: 'sleep',
-    async run(env, now) {
+    async run(env) {
       const endedRuns = await env.DB.prepare(
         `SELECT id FROM sandboxes WHERE status = 'running' AND run_expires_at <= ?1
           ORDER BY run_expires_at LIMIT ?2`,
       )
-        .bind(now, BATCH_SIZE)
+        .bind(Date.now(), BATCH_SIZE)
         .all<{ id: string }>();
-      let failed = 0;
-      for (const row of endedRuns.results ?? []) {
-        const error = refused(await sandboxProvider('linux')?.agentSandbox(env, row.id).sleep());
-        if (error) {
-          failed++;
-          console.warn(JSON.stringify({ fleetSweep: 'sleep', sandboxId: row.id, error }));
-        }
-      }
-      return { count: endedRuns.results?.length ?? 0, failed };
+      return sandboxStage(env, 'sleep', endedRuns.results ?? []);
     },
   },
 ];

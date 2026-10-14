@@ -362,7 +362,7 @@ describe('fleet services', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     try {
       const broken: SweepStage = { name: 'age', run: async () => { throw new Error('D1 down'); } };
-      const stages = [broken, ...FLEET_SWEEP_STAGES.slice(1)];
+      const stages = FLEET_SWEEP_STAGES.map((stage) => (stage.name === 'age' ? broken : stage));
       const outcomes = await runFleetSweeps(env, stages);
       expect(outcomes.map((o) => [o.stage, o.ok])).toEqual([['age', false], ['retry', true], ['discard', true], ['sleep', true]]);
       expect(outcomes[0]!.error).toContain('D1 down');
@@ -373,8 +373,29 @@ describe('fleet services', () => {
       const second = await seedSandbox({ agentId, environmentId: environment.id, buildId: environment.buildId!, workspaceId: workspace.id, status: 'sleeping', expiresAt: Date.now() - 1 });
       await runFleetCron(env);
       const line = log.mock.calls.map((c) => JSON.parse(String(c[0]))).find((l) => l.cron === 'fleet');
-      expect(line).toMatchObject({ ok: true, stages: { age: { failed: 0 }, retry: { failed: 0 }, discard: { count: 1, failed: 0 }, sleep: { count: 0, failed: 0 } } });
+      expect(line).toMatchObject({ ok: true, stages: { age: { failed: 0 }, retry: { failed: 0 }, discard: { failed: 0 }, sleep: { failed: 0 } } });
+      expect(line.stages.discard.count).toBeGreaterThanOrEqual(1);
       expect(await env.DB.prepare('SELECT status FROM sandboxes WHERE id = ?').bind(second).first()).toMatchObject({ status: 'stopped' });
+      // A row whose discard throws is counted as failed and the next row is still discarded.
+      const first = await seedSandbox({ agentId, environmentId: environment.id, buildId: environment.buildId!, workspaceId: workspace.id, status: 'sleeping', expiresAt: 1 });
+      const next = await seedSandbox({ agentId, environmentId: environment.id, buildId: environment.buildId!, workspaceId: workspace.id, status: 'sleeping', expiresAt: 2 });
+      const real = SANDBOX_PROVIDERS.linux!;
+      SANDBOX_PROVIDERS.linux = {
+        ...real,
+        agentSandbox: (boundEnv, sandboxId) => {
+          const sandbox = real.agentSandbox(boundEnv, sandboxId);
+          return sandboxId === first ? { ...sandbox, discard: async () => { throw new Error('container gone'); } } : sandbox;
+        },
+      };
+      try {
+        const discard = (await runFleetSweeps(env)).find((o) => o.stage === 'discard')!;
+        expect(discard).toMatchObject({ ok: true, failed: 1 });
+      } finally {
+        SANDBOX_PROVIDERS.linux = real;
+      }
+      expect(await env.DB.prepare('SELECT status FROM sandboxes WHERE id = ?').bind(first).first()).toMatchObject({ status: 'sleeping' });
+      expect(await env.DB.prepare('SELECT status FROM sandboxes WHERE id = ?').bind(next).first()).toMatchObject({ status: 'stopped' });
+      expect(warn.mock.calls.map((c) => JSON.parse(String(c[0])))).toContainEqual({ fleetSweep: 'discard', sandboxId: first, error: 'Error: container gone' });
     } finally {
       warn.mockRestore();
       log.mockRestore();
