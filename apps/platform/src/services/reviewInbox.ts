@@ -64,7 +64,7 @@ export interface ReviewInbox {
   counts: { changes: number; escalations: number; awaitingApproval: number; staleApprovals: number };
   repositories: number;
   truncated: boolean;
-  truncatedReason: 'repositories' | null;
+  truncatedReason: 'repositories' | 'admin-window' | null;
   nextCursor: string | null;
 }
 
@@ -110,7 +110,7 @@ export function groupInbox(items: InboxItem[]): InboxGroup[] {
  * Repositories the actor may review that hold a live change, newest push
  * first. The candidate filter only narrows the read; `authorizeRepo` decides.
  */
-async function reviewableRepos(env: Env, actor: Actor): Promise<{ repos: RepoRow[]; truncated: boolean }> {
+async function reviewableRepos(env: Env, actor: Actor): Promise<{ repos: RepoRow[]; truncatedReason: ReviewInbox['truncatedReason'] }> {
   const db = env.DB;
   const admin = actor.user.is_admin === true;
   // Each source is an index probe from the viewer (idx_repos_owner, idx_repos_owner_org, idx_repo_grants_user),
@@ -148,7 +148,7 @@ async function reviewableRepos(env: Env, actor: Actor): Promise<{ repos: RepoRow
     const d = await authorizeRepo(env, repo, actor, 'write', 'page', facts);
     if (d.ok) repos.push(d.repo);
   }
-  return { repos, truncated: rows.length > INBOX_LIMITS.reposMax || windowFull };
+  return { repos, truncatedReason: rows.length > INBOX_LIMITS.reposMax ? 'repositories' : windowFull ? 'admin-window' : null };
 }
 
 /** GET /inbox: one page of pending changes across the repositories the actor may review. */
@@ -166,7 +166,7 @@ export async function reviewInbox(env: Env, actor: Actor, q: { limit?: string; c
     after = decodeCursor(q.cursor);
     if (!after) return fail(400, 'INVALID_CURSOR', 'cursor is not a nextCursor from this page');
   }
-  const { repos, truncated } = await reviewableRepos(env, actor);
+  const { repos, truncatedReason } = await reviewableRepos(env, actor);
   const byId = new Map(repos.map((r) => [r.id, r]));
   const repoIds = [...byId.keys()];
   const page = await pendingAcross(env, repoIds, { limit, window: INBOX_LIMITS.scanWindow, after });
@@ -188,8 +188,8 @@ export async function reviewInbox(env: Env, actor: Actor, q: { limit?: string; c
         staleApprovals: items.reduce((n, i) => n + i.staleApprovals, 0),
       },
       repositories: repos.length,
-      truncated,
-      truncatedReason: truncated ? 'repositories' : null,
+      truncated: truncatedReason !== null,
+      truncatedReason,
       nextCursor: more && cursor ? encodeCursor(cursor) : null,
     },
   };

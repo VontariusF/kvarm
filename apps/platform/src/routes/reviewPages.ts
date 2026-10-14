@@ -110,7 +110,7 @@ function flash(c: Context<App>, inline = false): string {
   const done = c.req.query('done');
   // An error that names an inbox item shown on this page is rendered next to that item instead.
   const error = inline ? undefined : c.req.query('error');
-  if (done && DONE_TEXT[done]) return html`<div class="k-note signal" role="status">${DONE_TEXT[done]}</div>`;
+  if (done && Object.hasOwn(DONE_TEXT, done)) return html`<div class="k-note signal" role="status">${DONE_TEXT[done]}</div>`;
   return error ? errorNote(error) : '';
 }
 
@@ -285,9 +285,12 @@ inboxPages.get('/', async (c) => {
       { label: 'Repositories', value: inbox.repositories },
     ],
   );
-  const truncated = inbox.truncated
-    ? html`<div class="k-note warn" role="note">Showing the ${INBOX_LIMITS.reposMax} most recently pushed repositories you can review; others are not scanned on this page.</div>`
-    : '';
+  const truncated =
+    inbox.truncatedReason === 'repositories'
+      ? html`<div class="k-note warn" role="note">Showing the ${INBOX_LIMITS.reposMax} most recently pushed repositories you can review; others are not scanned on this page.</div>`
+      : inbox.truncatedReason === 'admin-window'
+        ? html`<div class="k-note warn" role="note">As instance admin you see your own repositories and the ${INBOX_LIMITS.adminReposWindow} most recently pushed; older ones are not scanned on this page.</div>`
+        : '';
   const groups = inbox.groups
     .map(
       (g) => html`

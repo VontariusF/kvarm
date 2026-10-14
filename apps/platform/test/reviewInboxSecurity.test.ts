@@ -14,6 +14,7 @@ import { COST_HEADER, parseCostHeader } from '../src/cost/meter';
 import { toUserRow } from '../src/db/users';
 import worker from '../src/index';
 import { mintAgentToken } from '../src/services/agents';
+import { validateOrgLogin } from '../src/services/orgs';
 import { INBOX_LIMITS } from '../src/services/reviewInbox';
 import { FakeRepo, commit, fakeArtifacts, fakeRepos } from './helpers/fakeArtifacts';
 
@@ -178,6 +179,10 @@ describe('concealment', () => {
     expect(await count("SELECT COUNT(*) AS n FROM change_escalations WHERE id = ? AND state = 'open'", esc.org)).toBe(1);
   });
 
+  it('reserves the inbox path, so no account’s profile hides behind it', () => {
+    expect(validateOrgLogin('inbox')).toBe('login is reserved');
+  });
+
   it('never shows one user the inbox count another user’s /inbox remembered', async () => {
     const own = await call('/inbox', tok[OWNER]);
     expect(own.text).toMatch(/<a class="k-needs" href="\/inbox"[^>]*><span>Needs you<\/span><b>[1-9]/);
@@ -284,6 +289,12 @@ describe('escaping', () => {
       expect(r.status, path).toBe(200);
       expect(r.text, path).not.toContain(probe);
       expect(unsafe(r.text), path).toEqual([]);
+    }
+    // Names every object inherits are not outcomes.
+    for (const done of ['constructor', 'toString', '__proto__']) {
+      const r = await call(`/${OWNER}/core/changes/2?done=${done}`, tok[OWNER]);
+      expect(r.text, done).not.toContain('class="k-note signal" role="status"');
+      expect(r.text, done).not.toContain('[native code]');
     }
     const cursor = await call(`/inbox?cursor=${encodeURIComponent(XSS)}`, tok[OWNER]);
     expect(cursor.status).toBe(400);

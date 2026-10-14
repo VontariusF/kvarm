@@ -120,6 +120,6 @@ describe('review inbox read bounds (architecture §10)', () => {
     expect(r.status).toBe(200);
     expect(r.cost.d1).toBeLessThanOrEqual(6);
     expect(r.cost.rr).toBeLessThan(PAGE_ROWS + 7 * INBOX_LIMITS.adminReposWindow);
-    expect(r.text).toContain('others are not scanned on this page');
+    expect(r.text).toContain('As instance admin you see your own repositories and the 500 most recently pushed');
   });
 });

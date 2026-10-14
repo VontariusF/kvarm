@@ -41,6 +41,8 @@ export const RESERVED_LOGINS: ReadonlySet<string> = new Set([
   'auth',
   'healthz',
   'import-repo',
+  // The review inbox page (routes/reviewPages.ts) is mounted ahead of account profiles.
+  'inbox',
   'login',
   'logout',
   'mcp',
