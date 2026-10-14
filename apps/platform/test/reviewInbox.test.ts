@@ -337,6 +337,9 @@ describe('change page', () => {
     expect(r.text).toContain('One reviewer approved the head another asked to change.');
     expect(r.text).toContain(' by Kvarm</span>');
     expect(r.text).not.toContain('by system');
+    // A reviewer's note spans the table under its verdict instead of a narrow fifth column.
+    expect(r.text).toContain('<td colspan="4" class="k-cell-note">quotes still break</td>');
+    expect(r.text).not.toContain('scope="col">Note');
     // The open change is the current repository tab.
     expect(r.text).toContain('aria-current="page">Change #1</a>');
   });

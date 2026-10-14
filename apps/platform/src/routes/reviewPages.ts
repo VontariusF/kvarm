@@ -355,13 +355,13 @@ function verdictRows(reviews: ReviewView[]): string {
   const stale = new Set(staleApprovals(reviews));
   return reviews
     .map(
-      (r) => html`<tr class="${r.current ? '' : 'k-row-stale'}">
+      // The note gets a full-width row of its own: it is the part people read, and a fifth column left it ~90 px.
+      (r) => html`<tr class="${r.current ? '' : 'k-row-stale'}${r.body ? ' k-row-has-note' : ''}">
         <td><b>${reviewer(r)}</b><small>${r.reviewer.kind}</small></td>
         <td>${raw(verdictTag(r))} ${raw(staleTag(r, stale))}</td>
         <td class="k-cell-family">${raw(familyLabel(r.modelFamily, r.modelFamilyEvidence))}${raw(r.differentFamily ? html`<small>differs from the author's · ${r.differentFamilyEvidence ?? ''}</small>` : '')}</td>
         <td class="k-cell-sha"><code>${short(r.headSha)}</code></td>
-        <td class="k-cell-note">${r.body ?? ''}</td>
-      </tr>`,
+      </tr>${raw(r.body ? html`<tr class="k-row-note${r.current ? '' : ' k-row-stale'}"><td colspan="4" class="k-cell-note">${r.body}</td></tr>` : '')}`,
     )
     .join('');
 }
@@ -456,7 +456,7 @@ reviewPages.get('/changes/:number', async (c) => {
       <div class="panel-head"><h2 class="hud k-panel-title" id="verdicts-h">VERDICTS · <b>${packet.reviews.length}</b></h2><span class="hud">BOUND TO THE EXACT HEAD</span></div>
       ${raw(
         packet.reviews.length
-          ? html`<div class="tscroll"><table class="table"><thead><tr><th scope="col">Reviewer</th><th scope="col">Verdict</th><th scope="col">Model family</th><th scope="col">Head</th><th scope="col">Note</th></tr></thead><tbody>${raw(verdictRows(packet.reviews))}</tbody></table></div>`
+          ? html`<div class="tscroll"><table class="table"><thead><tr><th scope="col">Reviewer</th><th scope="col">Verdict</th><th scope="col">Model family</th><th scope="col">Head</th></tr></thead><tbody>${raw(verdictRows(packet.reviews))}</tbody></table></div>`
           : '<div class="k-empty">No one has reviewed this change yet.</div>',
       )}
     </section>`;

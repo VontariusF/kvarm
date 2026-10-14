@@ -245,6 +245,9 @@ body.k-app :where(a, button, summary, textarea):focus-visible { outline: 2px sol
 body.k-app .k-panel-title { margin: 0; font-weight: 400; }
 body.k-app .k-group-help { margin: 0; padding: var(--s3) var(--s4); border-bottom: 1px solid var(--hairline); color: var(--silver); font-size: var(--t-sm); }
 body.k-app .k-inbox-item { display: grid; grid-template-columns: 3px minmax(0, 1fr); gap: var(--s4); padding: var(--s4) var(--s4) var(--s4) 0; border-top: 1px solid var(--hairline); }
+/* Anchored items (a failed decision returns to #ch/...) clear the sticky top bar, and the rail below 900px. */
+body.k-app .k-inbox-item, body.k-app #decide, body.k-app #escalations { scroll-margin-top: 72px; }
+@media (max-width: 900px) { body.k-app .k-inbox-item, body.k-app #decide, body.k-app #escalations { scroll-margin-top: 116px; } }
 body.k-app .k-group-help + .k-inbox-item, body.k-app .panel-head + .k-inbox-item { border-top: 0; }
 body.k-app .k-inbox-item::before { content: ''; background: var(--hairline-2); }
 body.k-app .k-inbox-item.heat::before { background: var(--heat-4); }
@@ -269,7 +272,9 @@ body.k-app .k-cell-sha code { white-space: nowrap; overflow-wrap: normal; }
 /* The reviewer's note is the column people read: it keeps room, and the family cell wraps instead. */
 body.k-app .k-cell-family { max-width: 150px; }
 body.k-app .k-cell-family small { white-space: normal; }
-body.k-app .k-cell-note { min-width: 220px; max-width: 320px; white-space: pre-wrap; overflow-wrap: anywhere; }
+body.k-app .table tr.k-row-has-note td { border-bottom: 0; padding-bottom: var(--s1); }
+body.k-app .table td.k-cell-note { padding-top: 0; color: var(--bone); white-space: pre-wrap; overflow-wrap: anywhere; }
+body.k-app .table tr.k-row-stale td.k-cell-note { color: var(--steel); }
 body.k-app .k-decide > summary { width: max-content; list-style: none; }
 body.k-app .k-decide > summary::-webkit-details-marker { display: none; }
 body.k-app .k-decide[open] > summary { border-color: var(--bone); color: var(--bone); }
