@@ -355,6 +355,7 @@ body.k-app .k-prov { margin: 0; }
 .k-prov-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); min-height: 40px; padding: 0 var(--s3); border-bottom: 1px solid var(--hairline); }
 .k-prov-title, .k-prov-src, .k-prov-sub, .k-prov-key, .k-prov-facts dt { color: var(--steel); font: 400 var(--t-hud)/1.4 var(--f-hud); letter-spacing: .06em; text-transform: uppercase; }
 .k-prov-title { margin: 0; overflow-wrap: anywhere; }
+.k-prov-src { flex: none; white-space: nowrap; }
 .k-prov-level { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--s3); align-items: start; padding: var(--s3); border-bottom: 1px solid var(--hairline); }
 .k-prov-level p { margin: 0; color: var(--silver); font-size: var(--t-xs); }
 .k-prov-facts { display: grid; margin: 0; }

@@ -260,7 +260,8 @@ body.k-app .k-inbox-links { display: flex; flex-wrap: wrap; gap: var(--s2) var(-
 body.k-app .k-verdicts { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
 body.k-app .k-verdicts li { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); color: var(--silver); font-size: var(--t-xs); }
 body.k-app .k-verdicts b { color: var(--bone); font-weight: 500; }
-body.k-app .tag-await { border-color: rgb(15 103 245 / .65); color: var(--signal-hi); }
+/* Awaiting approval rides on most items; it stays quiet so the ink is left for the primary action. */
+body.k-app .tag-await { border-color: var(--steel); color: var(--silver); }
 /* A stale approval no longer counts: a risk the reader must see, so it takes heat. */
 body.k-app .tag-stale { border-style: dashed; border-color: var(--heat-4); color: var(--heat-4); }
 body.k-app .table tr.k-row-stale td, body.k-app .table tr.k-row-stale td b { color: var(--steel); }
@@ -279,7 +280,10 @@ body.k-app .k-decide-form textarea::placeholder { color: var(--steel); }
 body.k-app .k-decide-form textarea:focus { border-color: var(--signal); box-shadow: 0 0 0 2px var(--signal-ghost); }
 body.k-app .k-decide-form .actions { justify-content: flex-start; }
 body.k-app .k-pager { display: flex; justify-content: center; }
+body.k-app .k-term { border-radius: 0; }
 @media (max-width: 640px) {
   body.k-app .k-inbox-item { gap: var(--s3); padding-right: var(--s3); }
+  /* Decisions are taken on phones: 44px touch targets (WCAG 2.5.5). */
+  body.k-app .k-decide-form .actions .btn, body.k-app .k-decide > summary.btn { min-height: 44px; }
   body.k-app .k-decide-form .actions .btn { flex: 1 1 auto; }
 }
