@@ -19,7 +19,7 @@
 
 import type { RepoRow } from '../db/repos';
 import { evidenceForReader, evidenceFromRow } from './attribution';
-import { changeDecisionTask, decisionView, type DecisionRow, type DecisionView } from './decisions';
+import { CHANGE_DECISION_TASK_PREFIX, changeDecisionTask, decisionView, type DecisionRow, type DecisionView } from './decisions';
 import type { Evidence } from './provenance';
 
 export const PROVENANCE_PANEL_LIMITS = {
@@ -92,13 +92,13 @@ export async function commitProvenance(
         `SELECT d.id, d.task_id, d.paths, d.chosen_candidate, d.rejected_candidates, d.reason, d.actor, d.agent_id, d.agent_name, d.at
            FROM agent_decisions d
           WHERE d.repo_id = ?1
-            AND d.task_id IN (SELECT t FROM (SELECT DISTINCT 'change:' || u.change_number AS t FROM ref_updates u
+            AND d.task_id IN (SELECT t FROM (SELECT DISTINCT ?4 || u.change_number AS t FROM ref_updates u
                                               WHERE u.repo_id = ?1 AND u.new_sha = ?2 AND u.change_number IS NOT NULL
                                               LIMIT ${PROVENANCE_PANEL_LIMITS.changes})
                               UNION ALL SELECT ?3 WHERE ?3 IS NOT NULL)
           ORDER BY d.at DESC, d.id DESC LIMIT ${PROVENANCE_PANEL_LIMITS.decisions + 1}`,
       )
-      .bind(repo.id, sha ?? '', changeTask),
+      .bind(repo.id, sha ?? '', changeTask, CHANGE_DECISION_TASK_PREFIX),
   ]);
   const row = (ledger?.results as LedgerRow[] | undefined)?.[0];
   const rows = (decisions?.results as DecisionRow[] | undefined) ?? [];

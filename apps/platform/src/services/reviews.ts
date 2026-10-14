@@ -877,10 +877,19 @@ interface PendingAcrossRow extends PacketChangeRow {
   created_at: number;
 }
 
-/** Approvals of an older head whose principal has not approved the current one: they no longer count. */
+/**
+ * The newest approval of an older head per principal that has not approved
+ * the current one: those no longer count. One entry per principal.
+ */
 export function staleApprovals(reviews: readonly ReviewView[]): ReviewView[] {
-  const current = new Set(reviews.filter((r) => r.current && r.verdict === 'approve').map((r) => r.principal));
-  return reviews.filter((r) => r.verdict === 'approve' && !r.current && !current.has(r.principal));
+  const seen = new Set(reviews.filter((r) => r.current && r.verdict === 'approve').map((r) => r.principal));
+  const out: ReviewView[] = [];
+  for (const r of [...reviews].sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))) {
+    if (r.verdict !== 'approve' || r.current || seen.has(r.principal)) continue;
+    seen.add(r.principal);
+    out.push(r);
+  }
+  return out;
 }
 
 /**

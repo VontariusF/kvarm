@@ -25,13 +25,15 @@ import { authorizeRepo, type Actor } from './authz';
 import type { ChangeContext } from './changes';
 import { changeDecisionTask, recordDecision, type DecisionView } from './decisions';
 import type { EscalationReason } from './reviewGate';
-import { inboxCondition, pendingAcross, REVIEW_LIMITS, resolveEscalation, submitReview, type PendingChange, type ReviewVerdict } from './reviews';
+import { getReviewPacket, inboxCondition, pendingAcross, REVIEW_LIMITS, resolveEscalation, submitReview, type PendingChange, type ReviewVerdict } from './reviews';
 
 export const INBOX_LIMITS = {
   /** Repositories considered for one inbox read. */
   reposMax: 100,
   changesDefault: 25,
   changesMax: 50,
+  /** Candidate pages one inbox read scans to fill a page (candidates the gate does not block are skipped). */
+  scanRounds: 4,
   /** The note every page decision requires (the review body and the decision's reason). */
   noteMax: REVIEW_LIMITS.noteMax,
 };
@@ -147,8 +149,18 @@ export async function reviewInbox(env: Env, actor: Actor, q: { limit?: string; c
   }
   const { repos, truncated } = await reviewableRepos(env, actor);
   const byId = new Map(repos.map((r) => [r.id, r]));
-  const page = await pendingAcross(env, [...byId.keys()], { limit, after });
-  const items: InboxItem[] = page.changes.map((c) => {
+  const repoIds = [...byId.keys()];
+  const changes: PendingChange[] = [];
+  let cursor = after;
+  let more = false;
+  for (let round = 0; round < INBOX_LIMITS.scanRounds && changes.length < limit; round++) {
+    const page = await pendingAcross(env, repoIds, { limit: limit - changes.length, after: cursor });
+    changes.push(...page.changes);
+    more = page.more;
+    cursor = page.last ?? cursor;
+    if (!page.more) break;
+  }
+  const items: InboxItem[] = changes.map((c) => {
     const repo = byId.get(c.repoId)!;
     return { ...c, repo: { owner: repo.owner_login, name: repo.name }, reasons: inboxReasons(c) };
   });
@@ -165,7 +177,7 @@ export async function reviewInbox(env: Env, actor: Actor, q: { limit?: string; c
       repositories: repos.length,
       truncated,
       truncatedReason: truncated ? 'repositories' : null,
-      nextCursor: page.more && page.last ? encodeCursor(page.last) : null,
+      nextCursor: more && cursor ? encodeCursor(cursor) : null,
     },
   };
 }
@@ -206,6 +218,12 @@ export async function decideFromPage(cx: ChangeContext, rawNumber: string, d: Pa
   let state: string;
   let number: number;
   if (d.kind === 'review') {
+    // Record any escalation the gate requires but nobody opened yet, so a human approval answers it now
+    // instead of the approval's own packet read opening it right afterwards.
+    if (d.verdict === 'approve') {
+      const packet = await getReviewPacket(cx.env, cx.repo, rawNumber);
+      if (!packet.ok) return packet;
+    }
     const r = await submitReview(cx, rawNumber, { headSha: d.headSha, body: note.value }, d.verdict);
     if (!r.ok) return r;
     chosen = `${d.verdict}@${r.value.review.headSha}`;

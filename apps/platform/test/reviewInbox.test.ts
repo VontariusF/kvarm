@@ -17,6 +17,7 @@ import { COST_HEADER, parseCostHeader, type CostCounters } from '../src/cost/met
 import { toUserRow } from '../src/db/users';
 import worker from '../src/index';
 import { INBOX_LIMITS, parseDecisionNote } from '../src/services/reviewInbox';
+import { staleApprovals, type ReviewView } from '../src/services/reviews';
 import { FakeRepo, commit, fakeArtifacts, fakeRepos } from './helpers/fakeArtifacts';
 
 const baseEnv = cfEnv as unknown as Env;
@@ -213,6 +214,10 @@ beforeAll(async () => {
   // gamma#2: the protected-path escalation was never recorded.
   await seedChange('unrecorded', 'gamma', 2, { title: 'Unrecorded protected target', author: OTHER, headSha: head, createdAt: NOW - 210_000 });
 
+  // alpha#4: a human author's change with a reviewer's request for changes open.
+  await seedChange('own', 'alpha', 4, { title: 'Author asked to rework', author: 'ib-writer', headSha: head, createdAt: NOW - 300_000 });
+  await seedEscalation('own', 'review-blocked', head);
+
   tok.owner = (await mintPAT(env, ids[OWNER]!, 'owner', ['read', 'write', 'api'])).token;
   tok.writer = (await mintPAT(env, ids['ib-writer']!, 'writer', ['read', 'write', 'api'])).token;
   tok.reader = (await mintPAT(env, ids['ib-reader']!, 'reader', ['read', 'write', 'api'])).token;
@@ -294,6 +299,12 @@ describe('review inbox', () => {
     expect(parseDecisionNote(fits)).toEqual({ ok: true, value: fits.replace(/\r\n/g, '\n') });
   });
 
+  it('counts a stale approval once per principal', () => {
+    const v = (principal: string, current: boolean, updatedAt: string) => ({ principal, verdict: 'approve', current, updatedAt }) as ReviewView;
+    const reviews = [v('user:p', false, '2026-01-02T00:00:00Z'), v('user:p', false, '2026-01-01T00:00:00Z'), v('user:q', false, '2026-01-01T00:00:00Z'), v('user:q', true, '2026-01-03T00:00:00Z')];
+    expect(staleApprovals(reviews)).toEqual([reviews[0]]);
+  });
+
   it('shows the empty state in the product voice', async () => {
     const r = await call('/inbox', tok.reader);
     expect(r.status).toBe(200);
@@ -357,6 +368,25 @@ describe('deciding from the page', () => {
     const page = await call(`/${OWNER}/alpha/changes/2`, tok.owner);
     expect(page.text).toContain('class="k-prov"');
     expect(page.text).toContain(`approve@${head}`);
+  });
+
+  it('records a missing escalation before an approval, so the approval answers it', async () => {
+    const r = await call(`/${OWNER}/gamma/changes/2/review`, tok.owner, form({ verdict: 'approve', headSha: head, note: 'protected bump is fine', back: 'inbox' }));
+    expect(r.location).toBe('/inbox?done=approve');
+    const esc = await env.DB.prepare("SELECT state, resolution FROM change_escalations WHERE change_set_id = ? AND reason = 'protected-path'")
+      .bind(changeIds.unrecorded)
+      .first<Record<string, string>>();
+    expect(esc).toEqual({ state: 'resolved', resolution: 'approve' });
+    expect((await call('/inbox', tok.owner)).text).not.toContain('Unrecorded protected target');
+  });
+
+  it('gives a change author no resolve form for their own change', async () => {
+    const author = await call(`/${OWNER}/alpha/changes/4`, tok.writer);
+    expect(author.status).toBe(200);
+    expect(author.text).not.toContain('/resolve"');
+    expect(author.text).toContain('/review"');
+    const other = await call(`/${OWNER}/alpha/changes/4`, tok.owner);
+    expect(other.text).toContain('/resolve"');
   });
 
   it('refuses a review of a head that moved', async () => {

@@ -536,7 +536,10 @@ repoPages.get('/commit/:sha', async (c) => {
   const viewerLogin = resolved.viewer?.user.login ?? null;
   const base = `/${resolved.repo.owner_login}/${resolved.repo.name}`;
   // The panel renders nothing when the commit has neither attribution nor decisions.
-  const panel = provenancePanel(await (early ?? commitProvenance(c.env, resolved.repo, commit.hash, { admin })));
+  // An optional panel: a failed read leaves the commit page as it was rather than failing it.
+  const panel = provenancePanel(
+    (await (early ?? commitProvenance(c.env, resolved.repo, commit.hash, { admin })).catch(() => null)) ?? { attribution: null, decisions: [], decisionsTruncated: false },
+  );
   const body = html`
     <div class="card">
       <div class="card-title">

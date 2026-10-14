@@ -33,8 +33,10 @@ export const DECISION_LIMITS = {
 } as const;
 
 /** The task id that links a decision to a change set: the review pages record and read it (architecture §11.6). */
+export const CHANGE_DECISION_TASK_PREFIX = 'change:';
+
 export function changeDecisionTask(number: number): string {
-  return `change:${number}`;
+  return `${CHANGE_DECISION_TASK_PREFIX}${number}`;
 }
 
 export type RejectedCandidate = string | { id: string; reason?: string };

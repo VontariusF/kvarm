@@ -173,7 +173,12 @@ function pageHead(eyebrow: string, title: string, accent: string, human: string,
 // Inbox
 // ---------------------------------------------------------------------------
 
-function inboxItem(item: InboxItem, csrf: string): string {
+/** The author answers to reviewers, not for them: a change's own author gets no resolve form. */
+function mayResolve(authorPrincipal: string | null, viewerId: string): boolean {
+  return authorPrincipal !== `user:${viewerId}`;
+}
+
+function inboxItem(item: InboxItem, csrf: string, viewerId: string): string {
   const { owner, name } = item.repo;
   const idBase = `c-${item.id}`;
   const escalation = item.reasons[0] !== 'approvals-required';
@@ -211,7 +216,7 @@ function inboxItem(item: InboxItem, csrf: string): string {
         <details class="k-decide">
           <summary class="btn btn-sm">Decide</summary>
           <div class="k-decide-body">
-            ${raw(item.openEscalations.map((e) => resolveForm(owner, name, item.number, e, csrf, 'inbox', idBase)).join(''))}
+            ${raw(mayResolve(item.author.principal, viewerId) ? item.openEscalations.map((e) => resolveForm(owner, name, item.number, e, csrf, 'inbox', idBase)).join('') : '')}
             ${raw(reviewForm(owner, name, item.number, item.headSha, csrf, 'inbox', idBase))}
           </div>
         </details>
@@ -256,7 +261,7 @@ inboxPages.get('/', async (c) => {
       <section class="panel" aria-labelledby="g-${g.reason}">
         <div class="panel-head"><h2 class="hud k-panel-title" id="g-${g.reason}">${REASON_LABEL[g.reason]} · <b>${g.items.length}</b></h2></div>
         <p class="k-group-help">${REASON_HELP[g.reason]}</p>
-        ${raw(g.items.map((i) => inboxItem(i, csrf)).join(''))}
+        ${raw(g.items.map((i) => inboxItem(i, csrf, actor.user.id)).join(''))}
       </section>`,
     )
     .join('');
@@ -279,7 +284,14 @@ kvarm review approve &lt;number&gt; --repo &lt;owner/repo&gt;</code></pre>
     <div class="k-content">
       ${raw(flash(c))}
       ${raw(truncated)}
-      ${raw(groups || (c.req.query('cursor') ? '<div class="k-empty">No older changes.</div>' : empty))}
+      ${raw(
+        groups ||
+          (inbox.nextCursor
+            ? '<div class="k-note signal" role="status">None of the changes scanned for this page needs you. Older changes are still to check.</div>'
+            : c.req.query('cursor')
+              ? '<div class="k-empty">No older changes need you.</div>'
+              : empty),
+      )}
       ${raw(pager)}
     </div>`;
   return htmlResponse(await layout(body));
@@ -353,6 +365,9 @@ reviewPages.get('/changes/:number', async (c) => {
   if (number === null) return notFound(c);
   const repo = resolved.repo;
   const [row, packetResult] = await Promise.all([readChange(c.env, repo.id, number), getReviewPacket(c.env, repo, String(number))]);
+  if (!packetResult.ok && packetResult.status !== 404) {
+    return changeShell(c, resolved, 'Change unavailable', html`<div class="k-content"><div class="k-note risk" role="alert">${packetResult.error} <code>${packetResult.code}</code></div></div>`, packetResult.status);
+  }
   if (!row || !packetResult.ok) return notFound(c);
   const packet = packetResult.value;
   // The packet's head is the one the gate and verdicts describe; the panel follows it.
@@ -360,6 +375,7 @@ reviewPages.get('/changes/:number', async (c) => {
   const panel = await commitProvenance(c.env, repo, packet.headSha, { admin: resolved.role === 'admin', change: number });
   const live = packet.state === 'open' || packet.state === 'conflicted';
   const canDecide = live && resolved.viewer !== null && (resolved.role === 'write' || resolved.role === 'admin');
+  const canResolve = canDecide && mayResolve(packet.author.principal, resolved.viewer!.user.id);
   const csrf = canDecide ? await csrfField(c) : '';
   const owner = repo.owner_login;
   const stale = staleApprovals(packet.reviews);
@@ -397,7 +413,7 @@ reviewPages.get('/changes/:number', async (c) => {
     </section>`;
   const escalations = packet.escalations.length
     ? html`<section class="panel" aria-labelledby="esc-h"><div class="panel-head"><h2 class="hud k-panel-title" id="esc-h">ESCALATIONS · <b>${openEscalations.length}</b> OPEN</h2></div>${raw(
-        packet.escalations.map((e) => escalationBlock(owner, repo.name, packet, e, csrf, canDecide)).join(''),
+        packet.escalations.map((e) => escalationBlock(owner, repo.name, packet, e, csrf, canResolve)).join(''),
       )}</section>`
     : '';
   const decide = canDecide
