@@ -149,7 +149,7 @@ function resolveForm(owner: string, name: string, n: number, e: EscalationView, 
       <input type="hidden" name="back" value="${back}" />
       ${raw(noteField(`${idBase}-${e.id}`, `Resolution note: ${REASON_LABEL[e.reason]}`))}
       <div class="actions">
-        <button class="btn btn-primary" type="submit" name="resolution" value="resolve">Resolve</button>
+        <button class="btn" type="submit" name="resolution" value="resolve">Resolve</button>
         <button class="btn" type="submit" name="resolution" value="acknowledge">Acknowledge</button>
       </div>
     </form>`;
@@ -266,8 +266,8 @@ inboxPages.get('/', async (c) => {
     )
     .join('');
   const empty = html`
-    <section class="panel">
-      <div class="panel-head"><h2 class="hud k-panel-title">NOTHING WAITING</h2></div>
+    <section class="panel" aria-labelledby="empty-h">
+      <div class="panel-head"><h2 class="hud k-panel-title" id="empty-h">NOTHING WAITING</h2></div>
       <div class="k-empty">
         <p class="m-human">Nothing needs a human right now. When reviewers disagree, ask for changes, or a protected branch needs sign-off, the change lands here.</p>
         <pre class="k-term m-agent"><code>kvarm review pending --repo &lt;owner/repo&gt;
