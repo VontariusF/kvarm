@@ -883,6 +883,11 @@ function approvalRow(approval: SandboxApprovalView & { repo?: string }, csrf: st
 fleetPages.get('/', async (c) => {
   const actor = await sessionActor(c);
   if (!actor) return finish(c, c.redirect('/auth/sign-in?returnTo=%2Ffleet'));
+  return renderFleet(c, actor);
+});
+
+/** The fleet page; a refused approval decision re-renders it with `error` shown above the grid. */
+async function renderFleet(c: Context<App>, actor: ApiActor, error?: string, status = 200): Promise<Response> {
   const [mine, approvals] = await Promise.all([
     sandboxes.listMySandboxes(c.env, actor, { limit: 100 }),
     sandboxes.listMyPendingApprovals(c.env, actor),
@@ -924,6 +929,7 @@ fleetPages.get('/', async (c) => {
         { label: 'Environments', value: Number(envCount?.count ?? 0) },
       ],
     ))}
+    ${raw(flash(error))}
     <div class="k-grid">
       <div class="k-col">
         ${raw(pending.length
@@ -959,8 +965,8 @@ stop_sandbox &lt;id&gt; --discard</code></pre>
     repos: repositories.map((repo) => ({ ownerLogin: repo.owner_login, name: repo.name })),
     active: 'fleet',
   }, body);
-  return htmlResponse(c, page);
-});
+  return htmlResponse(c, page, status);
+}
 
 fleetPages.post('/approvals/:id', async (c) => {
   const actor = await sessionActor(c);
@@ -971,7 +977,13 @@ fleetPages.post('/approvals/:id', async (c) => {
   if (!owner || !name) return notFound(c);
   const repo = await getRepo(c.env.DB, owner, name);
   if (!repo) return notFound(c);
-  const decision = form.decision === 'approve' ? 'approve' : 'deny';
-  await sandboxes.decideSandboxApproval(sandboxContext(c, repo, actor), c.req.param('id'), decision);
+  // Anything but the two buttons' values is a malformed post, not a deny.
+  if (form.decision !== 'approve' && form.decision !== 'deny') {
+    return renderFleet(c, actor, 'Choose approve or deny to decide this approval. Nothing was changed.', 400);
+  }
+  const result = await sandboxes.decideSandboxApproval(sandboxContext(c, repo, actor), c.req.param('id'), form.decision);
+  if (!result.ok) {
+    return renderFleet(c, actor, `${result.error} (${result.code ?? result.status}). Nothing was changed.`, result.status);
+  }
   return finish(c, c.redirect('/fleet'));
 });

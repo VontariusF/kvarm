@@ -552,6 +552,57 @@ describe('fleet pages: session CSRF (architecture §11.1)', () => {
     expect(await status()).toBe('approved');
   });
 
+  describe('refused approval decisions', () => {
+    async function seedApproval(status: string, expiresAt = Date.now() + 60_000) {
+      const { id: sandboxId } = await seedRunningSandbox();
+      const approvalId = crypto.randomUUID();
+      await env.DB.prepare(`INSERT INTO sandbox_approvals (id, sandbox_id, repo_id, command, requested_by, status, created_at, expires_at) VALUES (?, ?, ?, 'npm publish', ?, ?, ?, ?)`)
+        .bind(approvalId, sandboxId, repo.id, ownerId, status, Date.now() - 1000, expiresAt).run();
+      return approvalId;
+    }
+    const row = (id: string) => env.DB.prepare('SELECT * FROM sandbox_approvals WHERE id = ?').bind(id).first();
+    const decide = (id: string, decision: string) =>
+      post(`/fleet/approvals/${id}`, `repo=${encodeURIComponent(`${OWNER}/fleet`)}${decision ? `&decision=${decision}` : ''}`, payload.csrf);
+
+    it('shows the service error for an already-decided approval and changes nothing', async () => {
+      const id = await seedApproval('approved');
+      const before = await row(id);
+      const res = await decide(id, 'deny');
+      expect(res.status).toBe(404);
+      expect(res.text).toContain('pending sandbox approval not found');
+      expect(res.text).toContain('APPROVAL_NOT_FOUND');
+      expect(await row(id)).toEqual(before);
+    });
+
+    it('shows the service error for an expired approval and changes nothing', async () => {
+      const id = await seedApproval('pending', Date.now() - 1000);
+      const before = await row(id);
+      const res = await decide(id, 'approve');
+      expect(res.status).toBe(404);
+      expect(res.text).toContain('APPROVAL_NOT_FOUND');
+      expect(await row(id)).toEqual(before);
+    });
+
+    it('answers 400 for a missing or unknown decision instead of denying', async () => {
+      const id = await seedApproval('pending');
+      const before = await row(id);
+      for (const decision of ['', 'maybe', 'APPROVE']) {
+        const res = await decide(id, decision);
+        expect(res.status, decision).toBe(400);
+        expect(res.text).toContain('Choose approve or deny');
+      }
+      expect(await row(id)).toEqual(before);
+    });
+
+    it('still redirects to the fleet page on success', async () => {
+      const id = await seedApproval('pending');
+      const res = await decide(id, 'deny');
+      expect(res.status).toBe(302);
+      expect(res.location).toBe('/fleet');
+      expect(await row(id)).toMatchObject({ status: 'denied' });
+    });
+  });
+
   it('still accepts bearer-token posts without a CSRF token', async () => {
     const pat = (await mintPAT(env, ownerId, 'fleet-pages', scopes)).token;
     const bearer = (path: string) =>
