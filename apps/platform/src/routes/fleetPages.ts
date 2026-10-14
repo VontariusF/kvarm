@@ -974,16 +974,15 @@ fleetPages.post('/approvals/:id', async (c) => {
   const form = await postedForm(c, actor);
   if (form instanceof Response) return form;
   const [owner, name] = String(form.repo ?? '').split('/');
-  if (!owner || !name) return notFound(c);
-  const repo = await getRepo(c.env.DB, owner, name);
-  if (!repo) return notFound(c);
+  const repo = owner && name ? await getRepo(c.env.DB, owner, name) : null;
+  if (!repo) return renderFleet(c, actor, 'The approval request named no repository you can decide for. Reload the page and try again.', 404);
   // Anything but the two buttons' values is a malformed post, not a deny.
   if (form.decision !== 'approve' && form.decision !== 'deny') {
     return renderFleet(c, actor, 'Choose approve or deny to decide this approval. Nothing was changed.', 400);
   }
   const result = await sandboxes.decideSandboxApproval(sandboxContext(c, repo, actor), c.req.param('id'), form.decision);
   if (!result.ok) {
-    return renderFleet(c, actor, `${result.error} (${result.code ?? result.status}). Nothing was changed.`, result.status);
+    return renderFleet(c, actor, `${result.error} (${result.code ?? result.status}). Reload to see the current state.`, result.status);
   }
   return finish(c, c.redirect('/fleet'));
 });

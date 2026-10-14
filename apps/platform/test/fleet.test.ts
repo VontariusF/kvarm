@@ -594,6 +594,14 @@ describe('fleet pages: session CSRF (architecture §11.1)', () => {
       expect(await row(id)).toEqual(before);
     });
 
+    it('shows an error rather than a bare 404 when the repo field is missing', async () => {
+      const id = await seedApproval('pending');
+      const res = await post(`/fleet/approvals/${id}`, 'decision=approve', payload.csrf);
+      expect(res.status).toBe(404);
+      expect(res.text).toContain('Reload the page');
+      expect(await row(id)).toMatchObject({ status: 'pending' });
+    });
+
     it('still redirects to the fleet page on success', async () => {
       const id = await seedApproval('pending');
       const res = await decide(id, 'deny');
