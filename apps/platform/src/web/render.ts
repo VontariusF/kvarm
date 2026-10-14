@@ -93,6 +93,7 @@ ${opts.script ? `<script type="module" defer>${opts.script}</script>` : ''}
     ${
       opts.userLogin
         ? `<a href="/${escapeHtml(opts.userLogin)}">${escapeHtml(opts.userLogin)}</a>
+           <a href="/inbox">Inbox</a>
            <a href="/fleet">Fleet</a>
            <a href="/settings/tokens">Tokens</a>
            <a href="/auth/logout">Sign out</a>`
@@ -112,7 +113,7 @@ export interface AppLayoutOptions extends PageOptions {
   needsYouCount?: number;
   runningCount?: number;
   repos?: Array<{ ownerLogin: string; name: string }>;
-  active?: 'home' | 'fleet' | 'tokens';
+  active?: 'home' | 'inbox' | 'fleet' | 'tokens';
 }
 
 export async function appLayout(env: Env, opts: AppLayoutOptions, body: string): Promise<string> {
@@ -185,6 +186,7 @@ export async function appLayout(env: Env, opts: AppLayoutOptions, body: string):
   <aside class="k-rail" aria-label="App">
     <nav>
       <a href="/" ${raw(opts.active === 'home' ? 'aria-current="page"' : '')}><svg aria-hidden="true"><use href="#g-reticle"/></svg>Home</a>
+      <a href="/inbox" ${raw(opts.active === 'inbox' ? 'aria-current="page"' : '')}><svg aria-hidden="true"><use href="#g-node"/></svg>Inbox</a>
       <a href="/fleet" ${raw(opts.active === 'fleet' ? 'aria-current="page"' : '')}><svg aria-hidden="true"><use href="#g-node"/></svg>Fleet<span class="n">${runningCount}</span></a>
       <a href="/settings/tokens" ${raw(opts.active === 'tokens' ? 'aria-current="page"' : '')}><svg aria-hidden="true"><use href="#g-x"/></svg>Tokens &amp; agents</a>
     </nav>

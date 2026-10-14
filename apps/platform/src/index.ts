@@ -33,6 +33,7 @@ import { fleetPages, fleetRepoPages } from './routes/fleetPages';
 import { issuePages } from './routes/issuePages';
 import { coordinationPages } from './routes/coordinationPages';
 import { comparePages } from './routes/comparePages';
+import { inboxPages, reviewPages } from './routes/reviewPages';
 import { installFetchMeter, serveMetered } from './cost/meter';
 import { presentsCredential, withPrivateCacheControl } from './cache/scope';
 
@@ -107,6 +108,7 @@ app.route('/api/v1', webhooksApi);
 // MCP tool calls are dispatched back through this router to their REST routes.
 app.all('/mcp', (c) => handleMcp(c.req.raw, c.env, async (req) => app.fetch(req, c.env, c.executionCtx)));
 app.route('/fleet', fleetPages);
+app.route('/inbox', inboxPages);
 app.route('/', web);
 // Repo pages mount after the generic web routes: /new-repo, /import-repo and
 // /settings/tokens are two-segment paths that must win over /:owner/:repo.
@@ -118,6 +120,8 @@ app.route('/:owner/:repo', issuePages);
 app.route('/:owner/:repo', repoPages);
 app.route('/:owner/:repo', coordinationPages);
 app.route('/:owner/:repo', comparePages);
+// The change page and its decide posts (/changes/...), issue #8.
+app.route('/:owner/:repo', reviewPages);
 
 // Static assets (public/*) as the final fallback.
 app.all('*', async (c) => {

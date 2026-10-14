@@ -783,12 +783,10 @@ export async function pendingReviews(env: Env, repo: RepoRow, q: { limit?: strin
     if (n === null) return fail(400, 'cursor is invalid', 'INVALID_CURSOR');
     before = n;
   }
-  const f = reviewFactExpressions('c');
   const { results } = await env.DB.prepare(
     `SELECT c.number, c.title, c.base_ref, c.head_sha, c.merge_policy, ${reviewFactsColumns('c')}
        FROM change_sets c
-      WHERE c.repo_id = ?1 AND c.state IN ('open', 'conflicted') AND c.merge_policy != 'draft' AND c.number < ?2
-        AND (${f.openCount} > 0 OR ${f.approvals} < ${f.required})
+      WHERE c.repo_id = ?1 AND c.number < ?2 AND ${pendingCondition('c')}
       ORDER BY c.number DESC LIMIT ?3`,
   )
     .bind(repo.id, before, limit + 1)
@@ -815,3 +813,134 @@ export async function pendingReviews(env: Env, repo: RepoRow, q: { limit?: strin
   };
 }
 
+
+/** A live, non-draft change still short of its required reviews or holding an open escalation. */
+function pendingCondition(c: string): string {
+  const f = reviewFactExpressions(c);
+  return `${c}.state IN ('open', 'conflicted') AND ${c}.merge_policy != 'draft' AND (${f.openCount} > 0 OR ${f.approvals} < ${f.required})`;
+}
+
+// ---------------------------------------------------------------------------
+// Pending reviews across repositories (the review inbox, services/reviewInbox.ts)
+// ---------------------------------------------------------------------------
+
+export const PENDING_ACROSS_LIMITS = {
+  /** Reviews shown per change (newest first); the packet has the rest. */
+  reviewsPerChange: 8,
+  /** Open escalations shown per change. */
+  escalationsPerChange: 8,
+};
+
+export interface PendingChange {
+  repoId: string;
+  number: number;
+  title: string;
+  state: string;
+  mergePolicy: string;
+  base: string;
+  headSha: string | null;
+  author: AuthorView;
+  approvals: { count: number; required: number; humans: number };
+  openEscalations: EscalationView[];
+  /** Newest first: current and stale reviews alike; `current: false` marks a review of an older head. */
+  reviews: ReviewView[];
+  /** Approvals of an older head: a push staled them and they no longer count. */
+  staleApprovals: number;
+  createdAt: string;
+  /** Sort key for the inbox cursor. */
+  createdAtMs: number;
+  id: string;
+}
+
+interface PendingAcrossRow extends PacketChangeRow {
+  repo_id: string;
+  title: string;
+  created_at: number;
+}
+
+/**
+ * Pending changes over the given repositories, newest first, `(created_at, id)`
+ * keyset-paged. Callers authorize the repository ids first; nothing here
+ * checks access. Two D1 round trips: the page, then one batch with each
+ * listed change's newest reviews and open escalations (window-bounded per change).
+ */
+export async function pendingAcross(
+  env: Env,
+  repoIds: readonly string[],
+  page: { limit: number; after: { at: number; id: string } | null },
+): Promise<{ changes: PendingChange[]; more: boolean }> {
+  if (repoIds.length === 0) return { changes: [], more: false };
+  const db = env.DB;
+  const { results } = await db
+    .prepare(
+      `SELECT c.id, c.repo_id, c.number, c.title, c.state, c.merge_policy, c.base_ref, c.head_sha, c.author_id, u.login AS author_login,
+              c.agent_meta, c.created_at,
+              (SELECT a.model_family FROM agents a WHERE a.id = json_extract(c.agent_meta, '$.agentId')) AS author_family,
+              ${reviewFactsColumns('c')}
+         FROM change_sets c LEFT JOIN users u ON u.id = c.author_id
+        WHERE c.repo_id IN (SELECT value FROM json_each(?1)) AND ${pendingCondition('c')}
+          AND (?2 IS NULL OR (c.created_at, c.id) < (?2, ?3))
+        ORDER BY c.created_at DESC, c.id DESC LIMIT ?4`,
+    )
+    .bind(JSON.stringify(repoIds), page.after?.at ?? null, page.after?.id ?? null, page.limit + 1)
+    .all<PendingAcrossRow>();
+  const rows = (results ?? []).slice(0, page.limit);
+  const more = (results ?? []).length > page.limit;
+  if (rows.length === 0) return { changes: [], more };
+  const ids = JSON.stringify(rows.map((r) => r.id));
+  const [reviewRes, escalationRes] = await db.batch([
+    db
+      .prepare(
+        `SELECT * FROM (
+           SELECT r.id, r.change_set_id, r.head_sha, r.principal, r.user_id, r.user_login, r.agent_id, r.agent_name, r.model_family, r.verdict,
+                  r.body, r.created_at, r.updated_at,
+                  ROW_NUMBER() OVER (PARTITION BY r.change_set_id ORDER BY r.updated_at DESC, r.id) AS k
+             FROM change_reviews r WHERE r.change_set_id IN (SELECT value FROM json_each(?1)))
+          WHERE k <= ${PENDING_ACROSS_LIMITS.reviewsPerChange}`,
+      )
+      .bind(ids),
+    db
+      .prepare(
+        `SELECT * FROM (
+           SELECT e.id, e.change_set_id, e.change_number, e.reason, e.state, e.head_sha, e.detail, e.opened_by, e.opened_at,
+                  e.resolved_by_login, e.resolution, e.note, e.resolved_at,
+                  ROW_NUMBER() OVER (PARTITION BY e.change_set_id ORDER BY e.opened_at DESC, e.id) AS k
+             FROM change_escalations e WHERE e.change_set_id IN (SELECT value FROM json_each(?1)) AND e.state = 'open')
+          WHERE k <= ${PENDING_ACROSS_LIMITS.escalationsPerChange}`,
+      )
+      .bind(ids),
+  ]);
+  const reviewsOf = new Map<string, Array<ReviewRow & { change_set_id: string }>>();
+  for (const r of (reviewRes?.results as Array<ReviewRow & { change_set_id: string }> | undefined) ?? []) {
+    reviewsOf.set(r.change_set_id, [...(reviewsOf.get(r.change_set_id) ?? []), r]);
+  }
+  const escalationsOf = new Map<string, EscalationRow[]>();
+  for (const e of (escalationRes?.results as Array<EscalationRow & { change_set_id: string }> | undefined) ?? []) {
+    escalationsOf.set(e.change_set_id, [...(escalationsOf.get(e.change_set_id) ?? []), e]);
+  }
+  const changes = rows.map((row): PendingChange => {
+    const author = authorView(row);
+    const facts = parseReviewFacts(row);
+    const reviews = (reviewsOf.get(row.id) ?? [])
+      .sort((a, b) => b.updated_at - a.updated_at || (a.id < b.id ? -1 : 1))
+      .map((r) => reviewView(r, row.head_sha, author));
+    return {
+      id: row.id,
+      repoId: row.repo_id,
+      number: row.number,
+      title: row.title,
+      state: row.state,
+      mergePolicy: row.merge_policy,
+      base: row.base_ref,
+      headSha: row.head_sha,
+      author,
+      approvals: { count: facts.approvals, required: facts.required, humans: facts.humans },
+      openEscalations: (escalationsOf.get(row.id) ?? []).sort((a, b) => b.opened_at - a.opened_at).map(escalationView),
+      reviews,
+      staleApprovals: reviews.filter((r) => r.verdict === 'approve' && !r.current).length,
+      createdAt: iso(row.created_at),
+      createdAtMs: row.created_at,
+    };
+  });
+  return { changes, more };
+}

@@ -346,3 +346,38 @@ form.inline select { width: auto; }
 .comment .muted { font-size: 12px; margin-top: 2px; }
 .new-issue > summary { list-style: none; }
 .new-issue > summary::-webkit-details-marker { display: none; }
+
+/* ── Provenance panel (render/provenance.ts) ───────────────────────────
+   Shared by the commit page and the app shell, so it is unscoped; built
+   only from the brand tokens (docs/brand.md), which both pages load. */
+.k-prov { margin: var(--s4) 0 0; border: 1px solid var(--hairline); background: var(--carbon); color: var(--silver); font: 400 var(--t-sm)/1.5 var(--f-sans); }
+body.k-app .k-prov { margin: 0; }
+.k-prov-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); min-height: 40px; padding: 0 var(--s3); border-bottom: 1px solid var(--hairline); }
+.k-prov-title, .k-prov-src, .k-prov-sub, .k-prov-key, .k-prov-facts dt { color: var(--steel); font: 400 var(--t-hud)/1.4 var(--f-hud); letter-spacing: .06em; text-transform: uppercase; }
+.k-prov-title { margin: 0; overflow-wrap: anywhere; }
+.k-prov-level { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--s3); align-items: start; padding: var(--s3); border-bottom: 1px solid var(--hairline); }
+.k-prov-level p { margin: 0; color: var(--silver); font-size: var(--t-xs); }
+.k-prov-facts { display: grid; margin: 0; }
+.k-prov-facts > div { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: var(--s3); padding: var(--s2) var(--s3); border-bottom: 1px solid var(--hairline); }
+.k-prov-facts dt { line-height: 1.8; }
+.k-prov-facts dd { min-width: 0; margin: 0; color: var(--bone); overflow-wrap: anywhere; }
+.k-prov code { padding: 0; border: 0; background: none; color: var(--silver); font: 400 var(--t-xs)/1.5 var(--f-mono); overflow-wrap: anywhere; }
+.k-prov-none { color: var(--steel); }
+.k-prov-sub { margin: 0 0 var(--s2); }
+.k-prov-why, .k-prov-decisions { padding: var(--s3); border-bottom: 1px solid var(--hairline); }
+.k-prov > :last-child, .k-prov-facts > div:last-child { border-bottom: 0; }
+.k-prov-why ul, .k-prov-decisions ol, .k-prov-rejected ul { display: grid; gap: var(--s2); margin: 0; padding: 0; list-style: none; }
+.k-prov-why li { font-size: var(--t-xs); }
+.k-prov-why li code { color: var(--steel); }
+.k-prov-decisions ol > li { display: grid; gap: var(--s1); padding: var(--s1) 0 var(--s1) var(--s3); border-left: 2px solid var(--hairline-2); }
+.k-prov-key { margin-right: var(--s2); }
+.k-prov-chosen, .k-prov-reason, .k-prov-meta { margin: 0; }
+.k-prov-chosen code { color: var(--bone); }
+.k-prov-reason { color: var(--bone); white-space: pre-wrap; overflow-wrap: anywhere; }
+.k-prov-meta { color: var(--steel); font-size: var(--t-xs); }
+.k-prov-rejected { display: grid; gap: var(--s1); }
+.k-prov-rejected ul { gap: var(--s1); }
+/* Evidence levels: one quiet tone each; heat stays reserved for contention. */
+.k-ev { display: inline-flex; align-items: center; min-height: 20px; padding: 2px 6px; border: 1px solid var(--hairline-2); color: var(--steel); font: 400 var(--t-hud)/1.3 var(--f-hud); letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; }
+.k-ev-authenticated { border-color: var(--silver); color: var(--bone); }
+.k-ev-verified { border-color: var(--signal); background: var(--signal-ghost); color: var(--signal-hi); }

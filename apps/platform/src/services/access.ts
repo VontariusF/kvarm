@@ -174,7 +174,7 @@ interface Authoritative {
  */
 type FactsSubject = { userId: string } | { patHash: string } | { agentHash: string } | null;
 
-type RepoFactsRow = RepoRow & { facts_org_role: unknown; facts_grant: unknown; facts_user_id: string | null };
+export type RepoFactsRow = RepoRow & { facts_org_role: unknown; facts_grant: unknown; facts_user_id: string | null };
 
 /**
  * The repo row plus the subject's org membership and explicit grant, in one
@@ -205,7 +205,8 @@ function repoFactsSelect(db: D1Database, owner: string, name: string, subject: F
     .bind(owner, name, key);
 }
 
-function splitFacts(row: RepoFactsRow | RepoRow | undefined): {
+/** A repo row read with `facts_*` columns, split into the row and the caller's access facts. */
+export function splitFacts(row: RepoFactsRow | RepoRow | undefined): {
   repo: RepoRow | null;
   facts: AccessFacts;
   userId: string | null;
@@ -315,6 +316,19 @@ export async function resolvePAT(env: Env, token: string, clientIp: string | nul
     now,
   });
   return pat ? { ok: true, pat } : BAD_CREDENTIAL;
+}
+
+/**
+ * The actor a credential acts as on a page outside any repository (the review
+ * inbox): the session's user, or a verified human PAT with the `api` scope.
+ * Agent tokens, other PATs and rejected or throttled tokens act as anonymous,
+ * as they do on repository pages (rejectedCredentialAsAnonymous).
+ */
+export async function resolvePageActor(env: Env, credential: Credential, clientIp: string | null): Promise<Actor | null> {
+  if (credential.kind === 'anonymous') return null;
+  if (credential.kind === 'session') return credential.actor;
+  const res = await resolvePAT(env, credential.token, clientIp);
+  return res.ok ? actorFor('page', res.pat) : null;
 }
 
 /**

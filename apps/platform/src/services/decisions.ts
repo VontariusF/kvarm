@@ -32,6 +32,11 @@ export const DECISION_LIMITS = {
   pageMax: 50,
 } as const;
 
+/** The task id that links a decision to a change set: the review pages record and read it (architecture §11.6). */
+export function changeDecisionTask(number: number): string {
+  return `change:${number}`;
+}
+
 export type RejectedCandidate = string | { id: string; reason?: string };
 
 export interface DecisionView {
@@ -59,7 +64,7 @@ export interface DecisionContext {
   actor: Actor | null;
 }
 
-interface DecisionRow {
+export interface DecisionRow {
   id: string;
   task_id: string | null;
   paths: string;
@@ -76,7 +81,7 @@ type Fail = Extract<ServiceResult<never>, { ok: false }>;
 
 const fail = (status: number, code: string, error: string): Fail => ({ ok: false, status, code, error });
 
-function view(r: DecisionRow): DecisionView {
+export function decisionView(r: DecisionRow): DecisionView {
   return {
     id: r.id,
     task: r.task_id,
@@ -184,7 +189,7 @@ export async function recordDecision(cx: DecisionContext, input: unknown): Promi
         ]
       : []),
   ]);
-  return { ok: true, value: view(row) };
+  return { ok: true, value: decisionView(row) };
 }
 
 export interface ContextQuery {
@@ -280,6 +285,6 @@ export async function readContext(cx: DecisionContext, q: ContextQuery): Promise
   const kept = rows.slice(0, limit);
   return {
     ok: true,
-    value: { decisions: kept.map(view), truncated, nextCursor: truncated ? encodeCursor(kept[kept.length - 1]!) : null },
+    value: { decisions: kept.map(decisionView), truncated, nextCursor: truncated ? encodeCursor(kept[kept.length - 1]!) : null },
   };
 }

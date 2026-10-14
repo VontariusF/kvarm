@@ -239,3 +239,46 @@ body.k-app .k-approval-id-agent { font: 400 11px/1.4 var(--f-mono); letter-spaci
   body.k-app .k-form-footer .hud { display: none; }
   body.k-app .table { min-width: 700px; }
 }
+
+/* Review inbox and change page (routes/reviewPages.ts). */
+body.k-app :where(a, button, summary, textarea):focus-visible { outline: 2px solid var(--signal-hi); outline-offset: 2px; }
+body.k-app .k-panel-title { margin: 0; font-weight: 400; }
+body.k-app .k-group-help { margin: 0; padding: var(--s3) var(--s4); border-bottom: 1px solid var(--hairline); color: var(--silver); font-size: var(--t-sm); }
+body.k-app .k-inbox-item { display: grid; grid-template-columns: 3px minmax(0, 1fr); gap: var(--s4); padding: var(--s4) var(--s4) var(--s4) 0; border-top: 1px solid var(--hairline); }
+body.k-app .k-group-help + .k-inbox-item, body.k-app .panel-head + .k-inbox-item { border-top: 0; }
+body.k-app .k-inbox-item::before { content: ''; background: var(--hairline-2); }
+body.k-app .k-inbox-item.heat::before { background: var(--heat-4); }
+body.k-app .k-inbox-item.signal::before { background: var(--signal); }
+body.k-app .k-inbox-body { display: grid; gap: var(--s2); min-width: 0; }
+body.k-app .k-inbox-body p { margin: 0; }
+body.k-app .k-inbox-body h3 { margin: 0; font: 500 var(--t-md)/1.35 var(--f-sans); overflow-wrap: anywhere; }
+body.k-app .k-inbox-body h3 a { color: var(--bone); }
+body.k-app .k-inbox-body h3 a:hover { color: var(--signal-hi); }
+body.k-app .k-inbox-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+body.k-app .k-inbox-author, body.k-app .k-inbox-quiet { color: var(--silver); font-size: var(--t-xs); }
+body.k-app .k-inbox-links { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); font-size: var(--t-xs); }
+body.k-app .k-verdicts { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+body.k-app .k-verdicts li { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); color: var(--silver); font-size: var(--t-xs); }
+body.k-app .k-verdicts b { color: var(--bone); font-weight: 500; }
+body.k-app .tag-await { border-color: rgb(15 103 245 / .65); color: var(--signal-hi); }
+/* A stale approval no longer counts: a risk the reader must see, so it takes heat. */
+body.k-app .tag-stale { border-style: dashed; border-color: var(--heat-4); color: var(--heat-4); }
+body.k-app .table tr.k-row-stale td, body.k-app .table tr.k-row-stale td b { color: var(--steel); }
+body.k-app .k-cell-note { max-width: 320px; white-space: pre-wrap; overflow-wrap: anywhere; }
+body.k-app .k-decide > summary { width: max-content; list-style: none; }
+body.k-app .k-decide > summary::-webkit-details-marker { display: none; }
+body.k-app .k-decide[open] > summary { border-color: var(--bone); color: var(--bone); }
+body.k-app .k-decide-body { display: grid; gap: var(--s3); margin-top: var(--s3); }
+body.k-app .k-decide-form { display: grid; gap: var(--s3); margin: 0; padding: var(--s3); border: 1px solid var(--hairline); background: var(--graphite); }
+body.k-app .k-form-body > .k-decide-form { padding: 0; border: 0; background: none; }
+body.k-app .k-decide-form label { display: block; color: var(--steel); font: 400 var(--t-hud)/1.4 var(--f-hud); letter-spacing: .06em; text-transform: uppercase; }
+body.k-app .k-req { color: var(--silver); }
+body.k-app .k-decide-form textarea { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--hairline-2); border-radius: 0; outline: 0; background: var(--void); color: var(--bone); font: 400 var(--t-xs)/1.5 var(--f-mono); resize: vertical; }
+body.k-app .k-decide-form textarea::placeholder { color: var(--steel); }
+body.k-app .k-decide-form textarea:focus { border-color: var(--signal); box-shadow: 0 0 0 2px var(--signal-ghost); }
+body.k-app .k-decide-form .actions { justify-content: flex-start; }
+body.k-app .k-pager { display: flex; justify-content: center; }
+@media (max-width: 640px) {
+  body.k-app .k-inbox-item { gap: var(--s3); padding-right: var(--s3); }
+  body.k-app .k-decide-form .actions .btn { flex: 1 1 auto; }
+}
