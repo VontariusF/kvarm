@@ -814,10 +814,25 @@ export async function pendingReviews(env: Env, repo: RepoRow, q: { limit?: strin
 }
 
 
+
 /** A live, non-draft change still short of its required reviews or holding an open escalation. */
 function pendingCondition(c: string): string {
   const f = reviewFactExpressions(c);
   return `${c}.state IN ('open', 'conflicted') AND ${c}.merge_policy != 'draft' AND (${f.openCount} > 0 OR ${f.approvals} < ${f.required})`;
+}
+
+/**
+ * A superset of the changes the review gate blocks on a human: pending as
+ * above, or in a repository with branch rules (a human-approval requirement
+ * or a protected-path escalation nobody recorded yet), or named as an arena
+ * winner. The exact gate (`reviewGate` over the target's policy) then decides
+ * per row in pendingAcross.
+ */
+export function inboxCondition(c: string): string {
+  const f = reviewFactExpressions(c);
+  return `${c}.state IN ('open', 'conflicted') AND ${c}.merge_policy != 'draft'
+          AND (${f.openCount} > 0 OR ${f.approvals} < ${f.required}
+               OR EXISTS (SELECT 1 FROM branch_rules b WHERE b.repo_id = ${c}.repo_id) OR ${f.finalSelected})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -829,6 +844,8 @@ export const PENDING_ACROSS_LIMITS = {
   reviewsPerChange: 8,
   /** Open escalations shown per change. */
   escalationsPerChange: 8,
+  /** Branch rules read per repository on the page. */
+  rulesPerRepo: 50,
 };
 
 export interface PendingChange {
@@ -840,11 +857,13 @@ export interface PendingChange {
   base: string;
   headSha: string | null;
   author: AuthorView;
-  approvals: { count: number; required: number; humans: number };
+  approvals: { count: number; required: number; humans: number; humansRequired: number };
   openEscalations: EscalationView[];
+  /** Escalations the gate requires that were never recorded (opened when the change page is read). */
+  missingEscalations: EscalationReason[];
   /** Newest first: current and stale reviews alike; `current: false` marks a review of an older head. */
   reviews: ReviewView[];
-  /** Approvals of an older head: a push staled them and they no longer count. */
+  /** Principals whose approval a push staled and who have not approved the current head. */
   staleApprovals: number;
   createdAt: string;
   /** Sort key for the inbox cursor. */
@@ -858,18 +877,27 @@ interface PendingAcrossRow extends PacketChangeRow {
   created_at: number;
 }
 
+/** Approvals of an older head whose principal has not approved the current one: they no longer count. */
+export function staleApprovals(reviews: readonly ReviewView[]): ReviewView[] {
+  const current = new Set(reviews.filter((r) => r.current && r.verdict === 'approve').map((r) => r.principal));
+  return reviews.filter((r) => r.verdict === 'approve' && !r.current && !current.has(r.principal));
+}
+
 /**
- * Pending changes over the given repositories, newest first, `(created_at, id)`
- * keyset-paged. Callers authorize the repository ids first; nothing here
+ * Changes the review gate blocks on a human over the given repositories,
+ * newest first, `(created_at, id)` keyset-paged over the candidate rows (a
+ * page can hold fewer than `limit` changes when candidates turn out not to
+ * be blocked). Callers authorize the repository ids first; nothing here
  * checks access. Two D1 round trips: the page, then one batch with each
- * listed change's newest reviews and open escalations (window-bounded per change).
+ * listed change's newest reviews and open escalations (an index-ordered
+ * LIMIT per change) and the repositories' branch rules.
  */
 export async function pendingAcross(
   env: Env,
   repoIds: readonly string[],
   page: { limit: number; after: { at: number; id: string } | null },
-): Promise<{ changes: PendingChange[]; more: boolean }> {
-  if (repoIds.length === 0) return { changes: [], more: false };
+): Promise<{ changes: PendingChange[]; more: boolean; last: { at: number; id: string } | null }> {
+  if (repoIds.length === 0) return { changes: [], more: false, last: null };
   const db = env.DB;
   const { results } = await db
     .prepare(
@@ -878,7 +906,7 @@ export async function pendingAcross(
               (SELECT a.model_family FROM agents a WHERE a.id = json_extract(c.agent_meta, '$.agentId')) AS author_family,
               ${reviewFactsColumns('c')}
          FROM change_sets c LEFT JOIN users u ON u.id = c.author_id
-        WHERE c.repo_id IN (SELECT value FROM json_each(?1)) AND ${pendingCondition('c')}
+        WHERE c.repo_id IN (SELECT value FROM json_each(?1)) AND ${inboxCondition('c')}
           AND (?2 IS NULL OR (c.created_at, c.id) < (?2, ?3))
         ORDER BY c.created_at DESC, c.id DESC LIMIT ?4`,
     )
@@ -886,45 +914,60 @@ export async function pendingAcross(
     .all<PendingAcrossRow>();
   const rows = (results ?? []).slice(0, page.limit);
   const more = (results ?? []).length > page.limit;
-  if (rows.length === 0) return { changes: [], more };
+  const lastRow = rows[rows.length - 1];
+  const last = lastRow ? { at: lastRow.created_at, id: lastRow.id } : null;
+  if (rows.length === 0) return { changes: [], more, last };
   const ids = JSON.stringify(rows.map((r) => r.id));
-  const [reviewRes, escalationRes] = await db.batch([
+  const repos = JSON.stringify([...new Set(rows.map((r) => r.repo_id))]);
+  const [reviewRes, escalationRes, ruleRes] = await db.batch([
     db
       .prepare(
-        `SELECT * FROM (
-           SELECT r.id, r.change_set_id, r.head_sha, r.principal, r.user_id, r.user_login, r.agent_id, r.agent_name, r.model_family, r.verdict,
-                  r.body, r.created_at, r.updated_at,
-                  ROW_NUMBER() OVER (PARTITION BY r.change_set_id ORDER BY r.updated_at DESC, r.id) AS k
-             FROM change_reviews r WHERE r.change_set_id IN (SELECT value FROM json_each(?1)))
-          WHERE k <= ${PENDING_ACROSS_LIMITS.reviewsPerChange}`,
+        `SELECT r.id, r.change_set_id, r.head_sha, r.principal, r.user_id, r.user_login, r.agent_id, r.agent_name, r.model_family, r.verdict,
+                r.body, r.created_at, r.updated_at
+           FROM json_each(?1) j
+           JOIN change_reviews r ON r.id IN (SELECT x.id FROM change_reviews x WHERE x.change_set_id = j.value
+                                             ORDER BY x.created_at DESC LIMIT ${PENDING_ACROSS_LIMITS.reviewsPerChange})`,
       )
       .bind(ids),
     db
       .prepare(
-        `SELECT * FROM (
-           SELECT e.id, e.change_set_id, e.change_number, e.reason, e.state, e.head_sha, e.detail, e.opened_by, e.opened_at,
-                  e.resolved_by_login, e.resolution, e.note, e.resolved_at,
-                  ROW_NUMBER() OVER (PARTITION BY e.change_set_id ORDER BY e.opened_at DESC, e.id) AS k
-             FROM change_escalations e WHERE e.change_set_id IN (SELECT value FROM json_each(?1)) AND e.state = 'open')
-          WHERE k <= ${PENDING_ACROSS_LIMITS.escalationsPerChange}`,
+        `SELECT e.id, e.change_set_id, e.change_number, e.reason, e.state, e.head_sha, e.detail, e.opened_by, e.opened_at,
+                e.resolved_by_login, e.resolution, e.note, e.resolved_at
+           FROM json_each(?1) j
+           JOIN change_escalations e ON e.id IN (SELECT x.id FROM change_escalations x WHERE x.change_set_id = j.value AND x.state = 'open'
+                                                 ORDER BY x.opened_at DESC LIMIT ${PENDING_ACROSS_LIMITS.escalationsPerChange})`,
       )
       .bind(ids),
+    db
+      .prepare(
+        `SELECT b.repo_id, ${BRANCH_RULE_COLUMNS} FROM json_each(?1) j
+           JOIN branch_rules b ON b.id IN (SELECT x.id FROM branch_rules x WHERE x.repo_id = j.value LIMIT ${PENDING_ACROSS_LIMITS.rulesPerRepo})`,
+      )
+      .bind(repos),
   ]);
-  const reviewsOf = new Map<string, Array<ReviewRow & { change_set_id: string }>>();
-  for (const r of (reviewRes?.results as Array<ReviewRow & { change_set_id: string }> | undefined) ?? []) {
-    reviewsOf.set(r.change_set_id, [...(reviewsOf.get(r.change_set_id) ?? []), r]);
+  const group = <T extends { change_set_id: string }>(list: T[] | undefined): Map<string, T[]> => {
+    const m = new Map<string, T[]>();
+    for (const x of list ?? []) m.set(x.change_set_id, [...(m.get(x.change_set_id) ?? []), x]);
+    return m;
+  };
+  const reviewsOf = group(reviewRes?.results as Array<ReviewRow & { change_set_id: string }> | undefined);
+  const escalationsOf = group(escalationRes?.results as Array<EscalationRow & { change_set_id: string }> | undefined);
+  const rulesOf = new Map<string, BranchRule[]>();
+  for (const r of (ruleRes?.results as Array<BranchRuleRow & { repo_id: string }> | undefined) ?? []) {
+    rulesOf.set(r.repo_id, [...(rulesOf.get(r.repo_id) ?? []), ruleFromRow(r)]);
   }
-  const escalationsOf = new Map<string, EscalationRow[]>();
-  for (const e of (escalationRes?.results as Array<EscalationRow & { change_set_id: string }> | undefined) ?? []) {
-    escalationsOf.set(e.change_set_id, [...(escalationsOf.get(e.change_set_id) ?? []), e]);
-  }
-  const changes = rows.map((row): PendingChange => {
-    const author = authorView(row);
+  const changes: PendingChange[] = [];
+  for (const row of rows) {
     const facts = parseReviewFacts(row);
+    const policy = effectivePolicy(rulesOf.get(row.repo_id) ?? [], branchRef(row.base_ref));
+    const gate = reviewGate(facts, policy);
+    // Only what a human must answer: a change blocked by nothing (or by checks alone) is not inbox work.
+    if (gate.blockers.length === 0) continue;
+    const author = authorView(row);
     const reviews = (reviewsOf.get(row.id) ?? [])
       .sort((a, b) => b.updated_at - a.updated_at || (a.id < b.id ? -1 : 1))
       .map((r) => reviewView(r, row.head_sha, author));
-    return {
+    changes.push({
       id: row.id,
       repoId: row.repo_id,
       number: row.number,
@@ -934,13 +977,14 @@ export async function pendingAcross(
       base: row.base_ref,
       headSha: row.head_sha,
       author,
-      approvals: { count: facts.approvals, required: facts.required, humans: facts.humans },
+      approvals: { count: facts.approvals, required: facts.required, humans: facts.humans, humansRequired: policy.requiredApprovals },
       openEscalations: (escalationsOf.get(row.id) ?? []).sort((a, b) => b.opened_at - a.opened_at).map(escalationView),
+      missingEscalations: gate.missing,
       reviews,
-      staleApprovals: reviews.filter((r) => r.verdict === 'approve' && !r.current).length,
+      staleApprovals: staleApprovals(reviews).length,
       createdAt: iso(row.created_at),
       createdAtMs: row.created_at,
-    };
-  });
-  return { changes, more };
+    });
+  }
+  return { changes, more, last };
 }

@@ -520,6 +520,11 @@ repoPages.get('/commit/:sha', async (c) => {
   const resolved = await resolveRepo(c);
   if (!resolved) return notFound(c);
   const sha = c.req.param('sha');
+  // Provenance and decisions (issue #8): a full SHA lets the D1 read overlap the Artifacts one.
+  const admin = resolved.role === 'admin';
+  const early = /^[0-9a-f]{40}$/.test(sha) ? commitProvenance(c.env, resolved.repo, sha, { admin }) : null;
+  // Paths that return before awaiting it (404, warming) must not leave a rejection unhandled.
+  early?.catch(() => undefined);
   let commit: ArtifactsCommitMetadata | null;
   try {
     commit = await readCommit(c.env, resolved.repo.artifacts_name, sha);
@@ -530,8 +535,8 @@ repoPages.get('/commit/:sha', async (c) => {
   if (!commit) return notFound(c);
   const viewerLogin = resolved.viewer?.user.login ?? null;
   const base = `/${resolved.repo.owner_login}/${resolved.repo.name}`;
-  // Provenance and decisions (issue #8); the panel renders nothing when the commit has neither.
-  const panel = provenancePanel(await commitProvenance(c.env, resolved.repo, commit.hash, { admin: resolved.role === 'admin' }));
+  // The panel renders nothing when the commit has neither attribution nor decisions.
+  const panel = provenancePanel(await (early ?? commitProvenance(c.env, resolved.repo, commit.hash, { admin })));
   const body = html`
     <div class="card">
       <div class="card-title">

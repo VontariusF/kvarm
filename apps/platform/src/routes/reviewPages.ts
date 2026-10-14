@@ -28,7 +28,7 @@ import { resolvePageActor, resolveRepoAccess } from '../services/access';
 import { changeView, parseNumber, readChange, type ChangeContext } from '../services/changes';
 import { commitProvenance } from '../services/provenancePanel';
 import { decideFromPage, INBOX_LIMITS, reviewInbox, type InboxItem, type InboxReason, type PageDecision } from '../services/reviewInbox';
-import { getReviewPacket, type EscalationView, type ReviewPacket, type ReviewView } from '../services/reviews';
+import { getReviewPacket, staleApprovals, type EscalationView, type ReviewPacket, type ReviewView } from '../services/reviews';
 
 /** Mounted at `/inbox`, ahead of the generic web routes. */
 export const inboxPages = new Hono<App>();
@@ -71,6 +71,7 @@ const ERROR_TEXT: Record<string, string> = {
   ESCALATION_RESOLVED: 'Someone already resolved that escalation.',
   ESCALATION_NOT_FOUND: 'That escalation no longer exists.',
   INVALID_VERDICT: 'Pick approve or request changes.',
+  DECISION_NOT_RECORDED: 'Your review landed, but storing the decision record failed. Record it with record_decision.',
 };
 
 const short = (sha: string | null): string => (sha ? sha.slice(0, 10) : '—');
@@ -115,8 +116,8 @@ function familyLabel(family: string | null, evidence: ReviewView['modelFamilyEvi
   return html`<code>${family}</code> ${raw(evidenceBadge(evidence))}`;
 }
 
-function staleTag(r: ReviewView): string {
-  return r.current ? '' : html`<span class="tag tag-stale" title="Reviewed ${short(r.headSha)}; the head has moved, so this no longer counts">stale · ${short(r.headSha)}</span>`;
+function staleTag(r: ReviewView, stale: ReadonlySet<ReviewView>): string {
+  return !stale.has(r) ? '' : html`<span class="tag tag-stale" title="Reviewed ${short(r.headSha)}; the head has moved, so this no longer counts">stale · ${short(r.headSha)}</span>`;
 }
 
 function noteField(id: string, label: string): string {
@@ -179,10 +180,11 @@ function inboxItem(item: InboxItem, csrf: string): string {
   const reasonTags = item.reasons
     .map((r) => html`<span class="tag ${r === 'approvals-required' ? 'tag-await' : 'tag-pending'}">${REASON_LABEL[r]}</span>`)
     .join('');
+  const stale = new Set(staleApprovals(item.reviews));
   const verdicts = item.reviews.length
     ? html`<ul class="k-verdicts" aria-label="Verdicts">${raw(
         item.reviews
-          .map((r) => html`<li><b>${reviewer(r)}</b> ${raw(verdictTag(r))} ${raw(familyLabel(r.modelFamily, r.modelFamilyEvidence))} ${raw(staleTag(r))}</li>`)
+          .map((r) => html`<li><b>${reviewer(r)}</b> ${raw(verdictTag(r))} ${raw(familyLabel(r.modelFamily, r.modelFamilyEvidence))} ${raw(staleTag(r, stale))}</li>`)
           .join(''),
       )}</ul>`
     : '<p class="k-inbox-quiet">No reviews of any head yet.</p>';
@@ -195,6 +197,8 @@ function inboxItem(item: InboxItem, csrf: string): string {
         <span class="hud">${owner}/${name} · #${item.number} · into ${item.base} · ${timeAgo(item.createdAtMs)}</span>
         <h3><a href="${raw(changeHref(owner, name, item.number))}">${item.title}</a></h3>
         <p class="k-inbox-tags">${raw(reasonTags)}<span class="tag">approvals ${item.approvals.count}/${item.approvals.required}</span>${raw(
+          item.approvals.humansRequired ? html`<span class="tag">human ${item.approvals.humans}/${item.approvals.humansRequired}</span>` : '',
+        )}${raw(
           item.staleApprovals ? html`<span class="tag tag-stale">${item.staleApprovals} stale</span>` : '',
         )}</p>
         <p class="k-inbox-author">By ${raw(author)} · head <code>${short(item.headSha)}</code></p>
@@ -315,13 +319,14 @@ async function changeShell(c: Context<App>, resolved: Resolved, title: string, b
 }
 
 function verdictRows(reviews: ReviewView[]): string {
+  const stale = new Set(staleApprovals(reviews));
   return reviews
     .map(
       (r) => html`<tr class="${r.current ? '' : 'k-row-stale'}">
         <td><b>${reviewer(r)}</b><small>${r.reviewer.kind}</small></td>
-        <td>${raw(verdictTag(r))} ${raw(staleTag(r))}</td>
+        <td>${raw(verdictTag(r))} ${raw(staleTag(r, stale))}</td>
         <td>${raw(familyLabel(r.modelFamily, r.modelFamilyEvidence))}${raw(r.differentFamily ? html`<small>differs from the author's · ${r.differentFamilyEvidence ?? ''}</small>` : '')}</td>
-        <td><code>${short(r.headSha)}</code></td>
+        <td class="k-cell-sha"><code>${short(r.headSha)}</code></td>
         <td class="k-cell-note">${r.body ?? ''}</td>
       </tr>`,
     )
@@ -347,20 +352,17 @@ reviewPages.get('/changes/:number', async (c) => {
   const number = parseNumber(c.req.param('number'));
   if (number === null) return notFound(c);
   const repo = resolved.repo;
-  const row = await readChange(c.env, repo.id, number);
-  if (!row) return notFound(c);
-  const change = changeView(row);
-  const [packetResult, panel] = await Promise.all([
-    getReviewPacket(c.env, repo, String(number)),
-    commitProvenance(c.env, repo, change.headSha, { admin: resolved.role === 'admin', change: number }),
-  ]);
-  if (!packetResult.ok) return notFound(c);
+  const [row, packetResult] = await Promise.all([readChange(c.env, repo.id, number), getReviewPacket(c.env, repo, String(number))]);
+  if (!row || !packetResult.ok) return notFound(c);
   const packet = packetResult.value;
+  // The packet's head is the one the gate and verdicts describe; the panel follows it.
+  const change = { ...changeView(row), headSha: packet.headSha };
+  const panel = await commitProvenance(c.env, repo, packet.headSha, { admin: resolved.role === 'admin', change: number });
   const live = packet.state === 'open' || packet.state === 'conflicted';
   const canDecide = live && resolved.viewer !== null && (resolved.role === 'write' || resolved.role === 'admin');
   const csrf = canDecide ? await csrfField(c) : '';
   const owner = repo.owner_login;
-  const stale = packet.reviews.filter((r) => r.verdict === 'approve' && !r.current);
+  const stale = staleApprovals(packet.reviews);
   const openEscalations = packet.escalations.filter((e) => e.state === 'open');
   const author = packet.author.agent
     ? html`${packet.author.agent.name} ${raw(familyLabel(packet.author.modelFamily, packet.author.modelFamilyEvidence))}`
@@ -476,6 +478,7 @@ async function decide(c: Context<App>, toDecision: (form: Record<string, unknown
     if (r.code === 'CHANGE_NOT_FOUND') return notFound(c);
     return afterDecision(c, w.cx.repo, number, form, { error: r.code ?? 'FAILED' });
   }
+  if (!r.value.decision) return afterDecision(c, w.cx.repo, number, form, { error: 'DECISION_NOT_RECORDED' });
   return afterDecision(c, w.cx.repo, number, form, { done: label(d) });
 }
 

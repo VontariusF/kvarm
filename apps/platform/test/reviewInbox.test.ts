@@ -16,6 +16,7 @@ import { newSessionPayload, sessionCookie } from '../src/auth/workos';
 import { COST_HEADER, parseCostHeader, type CostCounters } from '../src/cost/meter';
 import { toUserRow } from '../src/db/users';
 import worker from '../src/index';
+import { INBOX_LIMITS, parseDecisionNote } from '../src/services/reviewInbox';
 import { FakeRepo, commit, fakeArtifacts, fakeRepos } from './helpers/fakeArtifacts';
 
 const baseEnv = cfEnv as unknown as Env;
@@ -194,6 +195,24 @@ beforeAll(async () => {
   await seedChange('granted', 'granted', 1, { title: 'Granted change', author: OTHER, headSha: head, createdAt: NOW - 3_000 });
   await seedEscalation('granted', 'final-selection', head);
 
+  // gamma: a branch rule wants one human approval on main; the review policy wants none.
+  await seedRepo(OWNER, 'gamma', 'private', NOW - 5_000);
+  await env.DB.prepare(
+    `INSERT INTO branch_rules (id, repo_id, pattern, required_approvals, created_by, created_at, updated_by, updated_at)
+     VALUES (?, ?, 'refs/heads/main', 1, ?, ?, ?, ?)`,
+  )
+    .bind(crypto.randomUUID(), repoIds.gamma, ids[OWNER], NOW, ids[OWNER], NOW)
+    .run();
+  // gamma#1: its protected-path escalation was acknowledged, yet the human approval is still missing;
+  // its one reviewer approved an older head and then the current one, so nothing is stale.
+  await seedChange('acknowledged', 'gamma', 1, { title: 'Acknowledged but unapproved', author: OTHER, headSha: head, createdAt: NOW - 200_000 });
+  await seedEscalation('acknowledged', 'protected-path', head);
+  await env.DB.prepare("UPDATE change_escalations SET state = 'resolved', resolution = 'acknowledge' WHERE change_set_id = ?").bind(changeIds.acknowledged).run();
+  await seedReview('acknowledged', { headSha: OLD_HEAD, login: 'ib-writer', verdict: 'approve', at: NOW - 190_000 });
+  await seedReview('acknowledged', { headSha: head, login: 'ib-writer', verdict: 'approve', at: NOW - 180_000 });
+  // gamma#2: the protected-path escalation was never recorded.
+  await seedChange('unrecorded', 'gamma', 2, { title: 'Unrecorded protected target', author: OTHER, headSha: head, createdAt: NOW - 210_000 });
+
   tok.owner = (await mintPAT(env, ids[OWNER]!, 'owner', ['read', 'write', 'api'])).token;
   tok.writer = (await mintPAT(env, ids['ib-writer']!, 'writer', ['read', 'write', 'api'])).token;
   tok.reader = (await mintPAT(env, ids['ib-reader']!, 'reader', ['read', 'write', 'api'])).token;
@@ -251,6 +270,28 @@ describe('review inbox', () => {
     expect(second.text).not.toContain('Granted change');
     expect((await call('/inbox?limit=500', tok.owner)).status).toBe(400);
     expect((await call('/inbox?cursor=nope', tok.owner)).status).toBe(400);
+  });
+
+  it('lists changes the branch rules hold for a human, and marks only approvals nobody renewed as stale', async () => {
+    const r = await call('/inbox', tok.owner);
+    const item = (title: string) => {
+      const at = r.text.indexOf(title);
+      expect(at, title).toBeGreaterThan(0);
+      return r.text.slice(r.text.lastIndexOf('<article', at), r.text.indexOf('</article>', at));
+    };
+    const acknowledged = item('Acknowledged but unapproved');
+    expect(acknowledged).toContain('Awaiting approval');
+    expect(acknowledged).toContain('human 0/1');
+    expect(acknowledged).not.toContain('tag-stale');
+    const unrecorded = item('Unrecorded protected target');
+    expect(unrecorded).toContain('Protected target');
+  });
+
+  it('counts CRLF line breaks once against the note limit', () => {
+    const note = `${'x'.repeat(INBOX_LIMITS.noteMax - 20)}${'\r\n'.repeat(20)}y`;
+    expect(parseDecisionNote(note).ok).toBe(false);
+    const fits = `${'x'.repeat(INBOX_LIMITS.noteMax - 21)}${'\r\n'.repeat(20)}y`;
+    expect(parseDecisionNote(fits)).toEqual({ ok: true, value: fits.replace(/\r\n/g, '\n') });
   });
 
   it('shows the empty state in the product voice', async () => {

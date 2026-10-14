@@ -25,7 +25,7 @@ import { authorizeRepo, type Actor } from './authz';
 import type { ChangeContext } from './changes';
 import { changeDecisionTask, recordDecision, type DecisionView } from './decisions';
 import type { EscalationReason } from './reviewGate';
-import { pendingAcross, REVIEW_LIMITS, resolveEscalation, submitReview, type PendingChange, type ReviewVerdict } from './reviews';
+import { inboxCondition, pendingAcross, REVIEW_LIMITS, resolveEscalation, submitReview, type PendingChange, type ReviewVerdict } from './reviews';
 
 export const INBOX_LIMITS = {
   /** Repositories considered for one inbox read. */
@@ -64,8 +64,8 @@ export interface ReviewInbox {
 type Fail = Extract<ServiceResult<never>, { ok: false }>;
 const fail = (status: number, code: string, error: string): Fail => ({ ok: false, status, code, error });
 
-function encodeCursor(c: PendingChange): string {
-  return btoa(JSON.stringify([c.createdAtMs, c.id])).replace(/=+$/, '');
+function encodeCursor(c: { at: number; id: string }): string {
+  return btoa(JSON.stringify([c.at, c.id])).replace(/=+$/, '');
 }
 
 function decodeCursor(raw: string): { at: number; id: string } | null {
@@ -81,12 +81,17 @@ function decodeCursor(raw: string): { at: number; id: string } | null {
 }
 
 /** The reasons a pending change waits for a human, in group order. */
-export function inboxReasons(c: Pick<PendingChange, 'openEscalations' | 'approvals'>): InboxReason[] {
-  const open = new Set<EscalationReason>(c.openEscalations.map((e) => e.reason));
+export function inboxReasons(c: Pick<PendingChange, 'openEscalations' | 'missingEscalations' | 'approvals'>): InboxReason[] {
+  const open = new Set<EscalationReason>([...c.openEscalations.map((e) => e.reason), ...c.missingEscalations]);
   const out: InboxReason[] = INBOX_REASONS.filter((r): r is EscalationReason => r !== 'approvals-required' && open.has(r as EscalationReason));
-  if (c.approvals.count < c.approvals.required) out.push('approvals-required');
+  if (awaitingApproval(c)) out.push('approvals-required');
   // A pending change always waits for something; an escalation beyond the per-change cap still places it.
   return out.length > 0 ? out : ['approvals-required'];
+}
+
+/** Short of the policy's approving reviews or of the protected target's human approvals. */
+export function awaitingApproval(c: Pick<PendingChange, 'approvals'>): boolean {
+  return c.approvals.count < c.approvals.required || c.approvals.humans < c.approvals.humansRequired;
 }
 
 /** Items grouped by their first reason, groups in INBOX_REASONS order, empty groups dropped. */
@@ -95,8 +100,8 @@ export function groupInbox(items: InboxItem[]): InboxGroup[] {
 }
 
 /**
- * Repositories the actor may review that hold a live change, newest push
- * first. The candidate filter only narrows the read; `authorizeRepo` decides.
+ * Repositories the actor may review that hold a change waiting for a human
+ * (the inbox candidate condition), newest push first. The candidate filter only narrows the read; `authorizeRepo` decides.
  */
 async function reviewableRepos(env: Env, actor: Actor): Promise<{ repos: RepoRow[]; truncated: boolean }> {
   const { results } = await env.DB.prepare(
@@ -108,7 +113,7 @@ async function reviewableRepos(env: Env, actor: Actor): Promise<{ repos: RepoRow
              OR (r.owner_org_id IS NULL AND r.owner_login = ?2)
              OR EXISTS (SELECT 1 FROM org_members m WHERE m.org_id = r.owner_org_id AND m.user_id = ?1 AND m.role IN ('owner', 'maintainer'))
              OR EXISTS (SELECT 1 FROM repo_grants g WHERE g.repo_id = r.id AND g.user_id = ?1 AND g.role IN ('write', 'admin')))
-        AND EXISTS (SELECT 1 FROM change_sets c WHERE c.repo_id = r.id AND c.state IN ('open', 'conflicted'))
+        AND EXISTS (SELECT 1 FROM change_sets c WHERE c.repo_id = r.id AND ${inboxCondition('c')})
       ORDER BY COALESCE(r.pushed_at, r.created_at) DESC, r.id
       LIMIT ?4`,
   )
@@ -147,21 +152,20 @@ export async function reviewInbox(env: Env, actor: Actor, q: { limit?: string; c
     const repo = byId.get(c.repoId)!;
     return { ...c, repo: { owner: repo.owner_login, name: repo.name }, reasons: inboxReasons(c) };
   });
-  const last = page.changes[page.changes.length - 1];
   return {
     ok: true,
     value: {
       groups: groupInbox(items),
       counts: {
         changes: items.length,
-        escalations: items.reduce((n, i) => n + i.openEscalations.length, 0),
-        awaitingApproval: items.filter((i) => i.approvals.count < i.approvals.required).length,
+        escalations: items.reduce((n, i) => n + i.openEscalations.length + i.missingEscalations.length, 0),
+        awaitingApproval: items.filter(awaitingApproval).length,
         staleApprovals: items.reduce((n, i) => n + i.staleApprovals, 0),
       },
       repositories: repos.length,
       truncated,
       truncatedReason: truncated ? 'repositories' : null,
-      nextCursor: page.more && last ? encodeCursor(last) : null,
+      nextCursor: page.more && page.last ? encodeCursor(page.last) : null,
     },
   };
 }
@@ -175,7 +179,8 @@ export type PageDecision =
   | { kind: 'resolve'; escalationId: string; resolution: 'resolve' | 'acknowledge' };
 
 export interface PageDecisionOutcome {
-  decision: DecisionView;
+  /** Null when the review or resolution landed but storing the decision row failed. */
+  decision: DecisionView | null;
   /** The change's state after the decision (an auto change may have merged). */
   state: string;
 }
@@ -183,8 +188,10 @@ export interface PageDecisionOutcome {
 /** The note a page decision requires: the review body or resolution note, and the decision's reason. */
 export function parseDecisionNote(v: unknown): ServiceResult<string> {
   if (typeof v !== 'string' || v.trim().length === 0) return fail(422, 'NOTE_REQUIRED', 'a note is required: say why, for the record');
-  if (v.length > INBOX_LIMITS.noteMax) return fail(422, 'INVALID_NOTE', `the note is at most ${INBOX_LIMITS.noteMax} characters`);
-  return { ok: true, value: v.trim() };
+  // Browsers submit textarea line breaks as CRLF, which maxlength does not count twice.
+  const note = v.replace(/\r\n/g, '\n').trim();
+  if (note.length > INBOX_LIMITS.noteMax) return fail(422, 'INVALID_NOTE', `the note is at most ${INBOX_LIMITS.noteMax} characters`);
+  return { ok: true, value: note };
 }
 
 /**
@@ -211,10 +218,17 @@ export async function decideFromPage(cx: ChangeContext, rawNumber: string, d: Pa
     state = r.value.packet.state;
     number = r.value.packet.number;
   }
-  const decision = await recordDecision(
-    { env: cx.env, repo: cx.repo, actor: cx.actor },
-    { task: changeDecisionTask(number), paths: [], chosen, rejected: [], reason: note.value },
-  );
-  if (!decision.ok) return decision;
-  return { ok: true, value: { decision: decision.value, state } };
+  // The review already landed and cannot be retried (a resolved escalation answers 409), so a failed
+  // decision write is reported to the caller rather than turned into an error for an action that happened.
+  let decision: DecisionView | null = null;
+  try {
+    const r = await recordDecision(
+      { env: cx.env, repo: cx.repo, actor: cx.actor },
+      { task: changeDecisionTask(number), paths: [], chosen, rejected: [], reason: note.value },
+    );
+    decision = r.ok ? r.value : null;
+  } catch (err) {
+    console.log(JSON.stringify({ inbox: 'decision-not-recorded', repo: cx.repo.id, change: number, error: String(err).slice(0, 200) }));
+  }
+  return { ok: true, value: { decision, state } };
 }
