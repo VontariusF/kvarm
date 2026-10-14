@@ -22,10 +22,10 @@ import type { RepoRow } from '../db/repos';
 import type { ServiceResult } from '../repos/service';
 import { splitFacts, type RepoFactsRow } from './access';
 import { authorizeRepo, type Actor } from './authz';
-import type { ChangeContext } from './changes';
+import { parseNumber, type ChangeContext } from './changes';
 import { changeDecisionTask, recordDecision, type DecisionView } from './decisions';
 import type { EscalationReason } from './reviewGate';
-import { getReviewPacket, LIVE_FOR_REVIEW, pendingAcross, REVIEW_LIMITS, resolveEscalation, submitReview, type PendingChange, type ReviewVerdict } from './reviews';
+import { changeAuthorPrincipal, getReviewPacket, LIVE_FOR_REVIEW, pendingAcross, REVIEW_LIMITS, resolveEscalation, submitReview, type PendingChange, type ReviewVerdict } from './reviews';
 
 export const INBOX_LIMITS = {
   /** Repositories considered for one inbox read. */
@@ -231,6 +231,10 @@ export async function decideFromPage(cx: ChangeContext, rawNumber: string, d: Pa
   let state: string;
   let number: number;
   if (d.kind === 'review') {
+    // REST may omit the head to review the current one; a page reviews only the head it rendered, so a post
+    // without one (a page that loaded before the change had a head, or a hand-made post) must not bind to a
+    // head nobody on the page saw.
+    if (!d.headSha) return fail(409, 'HEAD_MOVED', 'review the head the page showed: headSha is required');
     // Record any escalation the gate requires but nobody opened yet, so a human approval answers it now
     // instead of the approval's own packet read opening it right afterwards.
     if (d.verdict === 'approve') {
@@ -243,6 +247,12 @@ export async function decideFromPage(cx: ChangeContext, rawNumber: string, d: Pa
     state = r.value.packet.state;
     number = r.value.packet.number;
   } else {
+    // The page offers the author no resolve form (the author answers to reviewers, not for them), and the
+    // post holds to the same rule rather than trusting the hidden form; submitReview refuses SELF_REVIEW alike.
+    const n = parseNumber(rawNumber);
+    if (n !== null && cx.actor && (await changeAuthorPrincipal(cx.env, cx.repo.id, n)) === `user:${cx.actor.user.id}`) {
+      return fail(409, 'SELF_RESOLVE', 'the author of a change cannot resolve its escalations; another human must');
+    }
     const r = await resolveEscalation(cx, rawNumber, d.escalationId, { resolution: d.resolution, note: note.value });
     if (!r.ok) return r;
     chosen = `${d.resolution}:${r.value.escalation.reason}`;

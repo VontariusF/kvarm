@@ -72,6 +72,8 @@ const ERROR_TEXT: Record<string, string> = {
   ESCALATION_RESOLVED: 'Someone already resolved that escalation.',
   ESCALATION_NOT_FOUND: 'That escalation no longer exists.',
   INVALID_VERDICT: 'Pick approve or request changes.',
+  INVALID_RESOLUTION: 'Pick resolve or acknowledge.',
+  SELF_RESOLVE: 'You authored this change, so another human resolves its escalations.',
   DECISION_NOT_RECORDED: 'Your review landed, but storing the decision record failed. Record it with record_decision.',
 };
 
@@ -98,7 +100,10 @@ async function readForm(c: Context<App>): Promise<Record<string, unknown>> {
 }
 
 function errorNote(error: string): string {
-  return html`<div class="k-note risk" role="alert">${ERROR_TEXT[error] ?? 'The decision was not recorded.'} <code>${error}</code></div>`;
+  // `error` arrives in the query string, so only a code this page knows is shown back; anything else could be
+  // anyone's text presented as Kvarm's.
+  const known = Object.hasOwn(ERROR_TEXT, error);
+  return html`<div class="k-note risk" role="alert">${known ? ERROR_TEXT[error] : 'The decision was not recorded.'}${raw(known ? html` <code>${error}</code>` : '')}</div>`;
 }
 
 function flash(c: Context<App>, inline = false): string {
@@ -555,7 +560,8 @@ function afterDecision(
   return c.redirect(`${changeHref(repo.owner_login, repo.name, n)}?${query}#${panel}`, 303);
 }
 
-async function decide(c: Context<App>, toDecision: (form: Record<string, unknown>) => PageDecision | null, label: (d: PageDecision) => string): Promise<Response> {
+/** `toDecision` answers the form's decision, or the error code that refuses it. */
+async function decide(c: Context<App>, toDecision: (form: Record<string, unknown>) => PageDecision | string, label: (d: PageDecision) => string): Promise<Response> {
   const w = await writeAccess(c);
   if (!w) return notFound(c);
   const form = await readForm(c);
@@ -565,7 +571,7 @@ async function decide(c: Context<App>, toDecision: (form: Record<string, unknown
   if (parseNumber(number) === null) return notFound(c);
   const d = toDecision(form);
   const panel = c.req.param('id') ? 'escalations' : 'decide';
-  if (!d) return afterDecision(c, w.cx.repo, number, form, { error: 'INVALID_VERDICT' }, panel);
+  if (typeof d === 'string') return afterDecision(c, w.cx.repo, number, form, { error: d }, panel);
   const r = await decideFromPage(w.cx, number, d, form.note);
   if (!r.ok) {
     if (r.code === 'CHANGE_NOT_FOUND') return notFound(c);
@@ -582,7 +588,7 @@ reviewPages.post('/changes/:number/review', (c) =>
     c,
     (form) => {
       const verdict = form.verdict === 'approve' || form.verdict === 'request-changes' ? form.verdict : null;
-      if (!verdict) return null;
+      if (!verdict) return 'INVALID_VERDICT';
       const headSha = typeof form.headSha === 'string' && form.headSha.length > 0 ? form.headSha : null;
       return { kind: 'review', verdict, headSha };
     },
@@ -593,7 +599,12 @@ reviewPages.post('/changes/:number/review', (c) =>
 reviewPages.post('/changes/:number/escalations/:id/resolve', (c) =>
   decide(
     c,
-    (form) => ({ kind: 'resolve', escalationId: c.req.param('id') ?? '', resolution: form.resolution === 'acknowledge' ? 'acknowledge' : 'resolve' }),
+    (form) => {
+      // A missing value is the REST default (`resolve`); anything else outside the enum is refused, not reinterpreted.
+      const resolution = form.resolution === undefined ? 'resolve' : form.resolution;
+      if (resolution !== 'resolve' && resolution !== 'acknowledge') return 'INVALID_RESOLUTION';
+      return { kind: 'resolve', escalationId: c.req.param('id') ?? '', resolution };
+    },
     (d) => (d.kind === 'resolve' ? d.resolution : 'resolve'),
   ),
 );

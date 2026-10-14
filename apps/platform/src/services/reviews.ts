@@ -217,6 +217,16 @@ function authorView(row: PacketChangeRow): AuthorView {
   };
 }
 
+/** The principal that authored a change, as `authorView` names it; null when there is no such change or author. */
+export async function changeAuthorPrincipal(env: Env, repoId: string, number: number): Promise<string | null> {
+  const row = await env.DB.prepare('SELECT author_id, agent_meta FROM change_sets WHERE repo_id = ?1 AND number = ?2')
+    .bind(repoId, number)
+    .first<{ author_id: string | null; agent_meta: string | null }>();
+  if (!row) return null;
+  const agent = parseAgentMeta(row.agent_meta);
+  return agent ? `agent:${agent.id}` : row.author_id ? `user:${row.author_id}` : null;
+}
+
 const LEVEL_RANK: Record<EvidenceLevel, number> = { declared: 0, authenticated: 1, verified: 2 };
 
 /** The weaker of two evidence levels; null when either side has no family. */
