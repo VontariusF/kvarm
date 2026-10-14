@@ -27,6 +27,7 @@ import {
 } from '../auth/workos';
 import { provisionSessionUser } from '../services/identity';
 import { layout } from '../web/render';
+import { CSRF_REFUSED } from './pageCsrf';
 
 export const authRoutes = new Hono<{ Bindings: Env }>();
 
@@ -143,7 +144,7 @@ authRoutes.post('/logout', async (c) => {
   const { session } = await getSessionInfo(c.req.raw, c.env, { refresh: false });
   if (!session) return redirect('/', [clearSessionCookie()]);
   const form = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>);
-  if (!csrfTokenValid(session, form._csrf)) return c.text('invalid or missing CSRF token', 403);
+  if (!csrfTokenValid(session, form._csrf)) return c.text(CSRF_REFUSED, 403);
   await revokeSession(c.env, session);
   // Ending the WorkOS session too keeps the next sign-in from silently reusing it.
   const location = session.sessionId

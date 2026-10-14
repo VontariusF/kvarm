@@ -21,6 +21,7 @@ import type { RepoRow } from '../db/repos';
 import { clientIp, requestCredential, requestSession, type ApiActor, type App } from './api';
 import { csrfTokenValid } from '../auth/workos';
 import { csrfInput, layout } from '../web/render';
+import { CSRF_REFUSED } from './pageCsrf';
 import { repoPage } from '../render/repoShell';
 import {
   commitAt,
@@ -669,7 +670,7 @@ export async function sessionFormRefused(c: Context<App>, viewer: ApiActor, form
   if (viewer.via !== 'session') return null;
   const session = await requestSession(c);
   if (session && csrfTokenValid(session, form._csrf)) return null;
-  return c.text('invalid or missing CSRF token', 403);
+  return c.text(CSRF_REFUSED, 403);
 }
 
 repoPages.post('/settings', async (c) => {

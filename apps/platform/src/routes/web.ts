@@ -16,6 +16,7 @@ import type { UserRow } from '../db/users';
 import { csrfTokenValid, isSameOriginRequest, type SessionInfo } from '../auth/workos';
 import { mintPAT, parseScopes, revokePAT, SCOPES, type Scope } from '../auth/pat';
 import { csrfInput, layout } from '../web/render';
+import { CSRF_REFUSED } from './pageCsrf';
 import * as svc from '../repos/service';
 import * as agents from '../services/agents';
 import { linkWorkOSIdentity } from '../services/identity';
@@ -87,7 +88,7 @@ async function requireSessionForm(c: Context<App>): Promise<{ ctx: AuthedPageCtx
   const ctx = await requireSessionPage(c);
   if (ctx instanceof Response) return ctx;
   const form = (await c.req.parseBody({ all: true }).catch(() => ({}))) as Form;
-  if (!csrfTokenValid(ctx.session, first(form._csrf))) return c.text('invalid or missing CSRF token', 403);
+  if (!csrfTokenValid(ctx.session, first(form._csrf))) return c.text(CSRF_REFUSED, 403);
   return { ctx, form };
 }
 
