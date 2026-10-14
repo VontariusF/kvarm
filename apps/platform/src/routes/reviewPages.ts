@@ -27,6 +27,7 @@ import { notFound, resolveRepo, sessionFormRefused, type Resolved } from './repo
 import { resolvePageActor, resolveRepoAccess } from '../services/access';
 import { changeView, parseNumber, readChange, type ChangeContext } from '../services/changes';
 import { commitProvenance } from '../services/provenancePanel';
+import { forgetInboxCount, rememberInboxCount } from '../services/inboxCount';
 import { decideFromPage, INBOX_LIMITS, reviewInbox, type InboxItem, type InboxReason, type PageDecision } from '../services/reviewInbox';
 import { getReviewPacket, staleApprovals, type EscalationView, type ReviewPacket, type ReviewView } from '../services/reviews';
 
@@ -80,6 +81,9 @@ const changeHref = (owner: string, name: string, n: number): string => `${repoBa
 const compareHref = (owner: string, name: string, base: string, head: string | null): string =>
   `${repoBase(owner, name)}/compare/${encodeURIComponent(`${base}...${head ?? base}`)}`;
 
+/** An inbox item's anchor: owner and name never contain `/`, so it is unambiguous. */
+const itemKey = (owner: string, name: string, n: number): string => `ch/${owner}/${name}/${n}`;
+
 function htmlResponse(body: string, status = 200): Response {
   return new Response(body, { status, headers: HTML });
 }
@@ -93,14 +97,16 @@ async function readForm(c: Context<App>): Promise<Record<string, unknown>> {
   return (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>;
 }
 
-function flash(c: Context<App>): string {
+function errorNote(error: string): string {
+  return html`<div class="k-note risk" role="alert">${ERROR_TEXT[error] ?? 'The decision was not recorded.'} <code>${error}</code></div>`;
+}
+
+function flash(c: Context<App>, inline = false): string {
   const done = c.req.query('done');
-  const error = c.req.query('error');
+  // An error that names an inbox item shown on this page is rendered next to that item instead.
+  const error = inline ? undefined : c.req.query('error');
   if (done && DONE_TEXT[done]) return html`<div class="k-note signal" role="status">${DONE_TEXT[done]}</div>`;
-  if (error) {
-    return html`<div class="k-note risk" role="alert">${ERROR_TEXT[error] ?? 'The decision was not recorded.'} <code>${error}</code></div>`;
-  }
-  return '';
+  return error ? errorNote(error) : '';
 }
 
 function reviewer(r: ReviewView): string {
@@ -178,9 +184,9 @@ function mayResolve(authorPrincipal: string | null, viewerId: string): boolean {
   return authorPrincipal !== `user:${viewerId}`;
 }
 
-function inboxItem(item: InboxItem, csrf: string, viewerId: string): string {
+function inboxItem(item: InboxItem, csrf: string, viewerId: string, error: string | null): string {
   const { owner, name } = item.repo;
-  const idBase = `c-${item.id}`;
+  const idBase = itemKey(owner, name, item.number);
   const escalation = item.reasons[0] !== 'approvals-required';
   const reasonTags = item.reasons
     .map((r) => html`<span class="tag ${r === 'approvals-required' ? 'tag-await' : 'tag-pending'}">${REASON_LABEL[r]}</span>`)
@@ -213,9 +219,10 @@ function inboxItem(item: InboxItem, csrf: string, viewerId: string): string {
           <a href="${raw(compareHref(owner, name, item.base, item.headSha))}">Risk-ordered diff</a>
           <a href="${raw(`${changeHref(owner, name, item.number)}#verdicts`)}">All verdicts</a>
         </p>
-        <details class="k-decide">
+        <details class="k-decide"${raw(error ? ' open' : '')}>
           <summary class="btn btn-sm">Decide</summary>
           <div class="k-decide-body">
+            ${raw(error ? errorNote(error) : '')}
             ${raw(mayResolve(item.author.principal, viewerId) ? item.openEscalations.map((e) => resolveForm(owner, name, item.number, e, csrf, 'inbox', idBase)).join('') : '')}
             ${raw(reviewForm(owner, name, item.number, item.headSha, csrf, 'inbox', idBase))}
           </div>
@@ -231,13 +238,24 @@ inboxPages.get('/', async (c) => {
     reviewInbox(c.env, actor, { limit: c.req.query('limit'), cursor: c.req.query('cursor') }),
     listReposForOwner(c.env.DB, actor.user.login, 8),
   ]);
-  const layout = (body: string) =>
-    appLayout(c.env, { title: 'Inbox', userLogin: actor.user.login, userId: actor.user.id, repos: repos.map((x) => ({ ownerLogin: x.owner_login, name: x.name })), active: 'inbox' }, body);
+  const layout = (body: string, inboxCount?: { count: number; more: boolean }) =>
+    appLayout(
+      c.env,
+      { title: 'Inbox', userLogin: actor.user.login, userId: actor.user.id, repos: repos.map((x) => ({ ownerLogin: x.owner_login, name: x.name })), active: 'inbox', inboxCount },
+      body,
+    );
   if (!r.ok) {
     return htmlResponse(await layout(html`<div class="k-content"><div class="k-note risk" role="alert">${r.error} <code>${r.code}</code></div><p><a href="/inbox">Back to the inbox</a></p></div>`), r.status);
   }
   const inbox = r.value;
   const csrf = await csrfField(c);
+  const failedItem = c.req.query('error') ? (c.req.query('item') ?? null) : null;
+  const shown = new Set(inbox.groups.flatMap((g) => g.items.map((i) => itemKey(i.repo.owner, i.repo.name, i.number))));
+  const inline = failedItem !== null && shown.has(failedItem);
+  const firstPage = !c.req.query('cursor');
+  const inboxCount = firstPage ? { count: inbox.counts.changes, more: inbox.nextCursor !== null } : undefined;
+  // The header badge on other pages reads this count back (services/inboxCount.ts).
+  if (inboxCount) c.executionCtx.waitUntil(rememberInboxCount(actor.user.id, inboxCount));
   const waiting = inbox.counts.changes;
   const head = pageHead(
     'INBOX · NEEDS A HUMAN',
@@ -261,7 +279,7 @@ inboxPages.get('/', async (c) => {
       <section class="panel" aria-labelledby="g-${g.reason}">
         <div class="panel-head"><h2 class="hud k-panel-title" id="g-${g.reason}">${REASON_LABEL[g.reason]} · <b>${g.items.length}</b></h2></div>
         <p class="k-group-help">${REASON_HELP[g.reason]}</p>
-        ${raw(g.items.map((i) => inboxItem(i, csrf, actor.user.id)).join(''))}
+        ${raw(g.items.map((i) => inboxItem(i, csrf, actor.user.id, inline && itemKey(i.repo.owner, i.repo.name, i.number) === failedItem ? (c.req.query('error') ?? null) : null)).join(''))}
       </section>`,
     )
     .join('');
@@ -282,7 +300,7 @@ kvarm review approve &lt;number&gt; --repo &lt;owner/repo&gt;</code></pre>
   const body = html`
     ${raw(head)}
     <div class="k-content">
-      ${raw(flash(c))}
+      ${raw(flash(c, inline))}
       ${raw(truncated)}
       ${raw(
         groups ||
@@ -294,14 +312,14 @@ kvarm review approve &lt;number&gt; --repo &lt;owner/repo&gt;</code></pre>
       )}
       ${raw(pager)}
     </div>`;
-  return htmlResponse(await layout(body));
+  return htmlResponse(await layout(body, inboxCount));
 });
 
 // ---------------------------------------------------------------------------
 // Change page
 // ---------------------------------------------------------------------------
 
-async function changeShell(c: Context<App>, resolved: Resolved, title: string, body: string, status = 200): Promise<Response> {
+async function changeShell(c: Context<App>, resolved: Resolved, title: string, body: string, status = 200, current: number | null = null): Promise<Response> {
   const repo = resolved.repo;
   const base = repoBase(repo.owner_login, repo.name);
   const tabs: Array<[string, string]> = [
@@ -311,7 +329,10 @@ async function changeShell(c: Context<App>, resolved: Resolved, title: string, b
     ['Activity', `${base}/activity`],
     ['Train', `${base}/train`],
   ];
-  const tabLinks = tabs.map(([label, href]) => html`<a class="k-tab" href="${raw(href)}">${label}</a>`).join('');
+  // There is no change list yet, so the open change is its own, current tab.
+  const tabLinks =
+    tabs.map(([label, href]) => html`<a class="k-tab" href="${raw(href)}">${label}</a>`).join('') +
+    (current === null ? '' : html`<a class="k-tab active" href="${raw(changeHref(repo.owner_login, repo.name, current))}" aria-current="page">Change #${current}</a>`);
   const viewer = resolved.viewer;
   const owned = viewer ? await listReposForOwner(c.env.DB, viewer.user.login, 8) : [];
   const page = await appLayout(
@@ -337,7 +358,7 @@ function verdictRows(reviews: ReviewView[]): string {
       (r) => html`<tr class="${r.current ? '' : 'k-row-stale'}">
         <td><b>${reviewer(r)}</b><small>${r.reviewer.kind}</small></td>
         <td>${raw(verdictTag(r))} ${raw(staleTag(r, stale))}</td>
-        <td>${raw(familyLabel(r.modelFamily, r.modelFamilyEvidence))}${raw(r.differentFamily ? html`<small>differs from the author's · ${r.differentFamilyEvidence ?? ''}</small>` : '')}</td>
+        <td class="k-cell-family">${raw(familyLabel(r.modelFamily, r.modelFamilyEvidence))}${raw(r.differentFamily ? html`<small>differs from the author's · ${r.differentFamilyEvidence ?? ''}</small>` : '')}</td>
         <td class="k-cell-sha"><code>${short(r.headSha)}</code></td>
         <td class="k-cell-note">${r.body ?? ''}</td>
       </tr>`,
@@ -345,17 +366,45 @@ function verdictRows(reviews: ReviewView[]): string {
     .join('');
 }
 
+/** A stored principal (`agent:<id>`, `user:<id>`, `system`) as a display name, from what the packet already names. */
+function principalName(packet: ReviewPacket, principal: string | null): string | null {
+  if (!principal) return null;
+  if (principal === 'system') return 'Kvarm';
+  const r = packet.reviews.find((x) => x.principal === principal);
+  if (r) return reviewer(r);
+  if (packet.author.principal === principal) return packet.author.agent?.name ?? packet.author.login;
+  return principal.startsWith('agent:') ? 'an agent' : 'a reviewer';
+}
+
 function escalationBlock(owner: string, name: string, packet: ReviewPacket, e: EscalationView, csrf: string, canDecide: boolean): string {
   const open = e.state === 'open';
+  const by = principalName(packet, e.openedBy);
   return html`
     <div class="k-inbox-item ${open ? 'heat' : 'quiet'}">
       <div class="k-inbox-body">
-        <span class="hud">${REASON_LABEL[e.reason]} · ${e.state} · opened ${timeAgo(Date.parse(e.openedAt))}${e.openedBy ? ` by ${e.openedBy}` : ''}</span>
-        ${raw(e.detail ? html`<p>${e.detail}</p>` : '')}
+        <span class="hud">${REASON_LABEL[e.reason]} · ${e.state} · opened ${timeAgo(Date.parse(e.openedAt))}${by ? ` by ${by}` : ''}</span>
+        <p>${REASON_HELP[e.reason]}</p>
         ${raw(!open ? html`<p class="k-inbox-quiet">${e.resolution ?? 'resolved'} by ${e.resolvedBy ?? 'unknown'}${e.note ? raw(html`: ${e.note}`) : ''}</p>` : '')}
         ${raw(open && canDecide ? resolveForm(owner, name, packet.number, e, csrf, 'change', `e`) : '')}
       </div>
     </div>`;
+}
+
+/** Page copy for a review-gate blocker; the API keeps its own `error` strings. */
+function blockerText(code: string, p: ReviewPacket): string {
+  const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`;
+  switch (code) {
+    case 'APPROVALS_REQUIRED':
+      return `${p.base} is protected: it needs ${plural(p.approvals.humansRequired, 'approval')} of this head from a human other than the author. ${p.approvals.humans} so far; agent approvals do not count here.`;
+    case 'ESCALATION_OPEN': {
+      const open = [...new Set(p.escalations.filter((e) => e.state === 'open').map((e) => REASON_LABEL[e.reason]))];
+      return `${open.length ? open.join(', ') : 'An escalation'} waits for a human. Approving this head answers every open escalation, or resolve each one with a note.`;
+    }
+    case 'REVIEWS_REQUIRED':
+      return `The review policy wants ${plural(p.approvals.required, 'approving review')} of this head from someone other than the author. ${p.approvals.count} so far.`;
+    default:
+      return 'Something in the review gate still blocks this head.';
+  }
 }
 
 reviewPages.get('/changes/:number', async (c) => {
@@ -398,7 +447,7 @@ reviewPages.get('/changes/:number', async (c) => {
   );
   const gate = packet.satisfied
     ? html`<div class="k-note signal">Nothing in the review gate blocks head <code>${short(packet.headSha)}</code>.</div>`
-    : html`<div class="k-note warn"><b>The review gate blocks this head.</b>${raw(packet.blockers.map((b) => html`<p>${b.error}</p>`).join(''))}</div>`;
+    : html`<div class="k-note warn"><b>The review gate blocks this head.</b>${raw(packet.blockers.map((b) => html`<p>${blockerText(b.code, packet)}</p>`).join(''))}</div>`;
   const staleNote = stale.length
     ? html`<div class="k-note warn" role="note">${stale.length} approval${stale.length === 1 ? '' : 's'} went stale when the head moved to <code>${short(packet.headSha)}</code>. They no longer count; the current head needs its own review.</div>`
     : '';
@@ -412,12 +461,12 @@ reviewPages.get('/changes/:number', async (c) => {
       )}
     </section>`;
   const escalations = packet.escalations.length
-    ? html`<section class="panel" aria-labelledby="esc-h"><div class="panel-head"><h2 class="hud k-panel-title" id="esc-h">ESCALATIONS · <b>${openEscalations.length}</b> OPEN</h2></div>${raw(
+    ? html`<section class="panel" id="escalations" aria-labelledby="esc-h"><div class="panel-head"><h2 class="hud k-panel-title" id="esc-h">ESCALATIONS · <b>${openEscalations.length}</b> OPEN</h2></div>${raw(
         packet.escalations.map((e) => escalationBlock(owner, repo.name, packet, e, csrf, canResolve)).join(''),
       )}</section>`
     : '';
   const decide = canDecide
-    ? html`<section class="panel" aria-labelledby="decide-h"><div class="panel-head"><h2 class="hud k-panel-title" id="decide-h">YOUR REVIEW</h2><span class="hud">HEAD ${short(packet.headSha)}</span></div><div class="k-form-body">${raw(
+    ? html`<section class="panel" id="decide" aria-labelledby="decide-h"><div class="panel-head"><h2 class="hud k-panel-title" id="decide-h">YOUR REVIEW</h2><span class="hud">HEAD ${short(packet.headSha)}</span></div><div class="k-form-body">${raw(
         reviewForm(owner, repo.name, packet.number, packet.headSha, csrf, 'change', 'd'),
       )}</div></section>`
     : '';
@@ -446,7 +495,7 @@ reviewPages.get('/changes/:number', async (c) => {
         ${raw(links)}
       </div>
     </div>`;
-  return changeShell(c, resolved, `#${packet.number} ${change.title}`, body);
+  return changeShell(c, resolved, `#${packet.number} ${change.title}`, body, 200, packet.number);
 });
 
 // ---------------------------------------------------------------------------
@@ -473,10 +522,26 @@ async function writeAccess(c: Context<App>): Promise<{ cx: ChangeContext; actor:
 }
 
 /** Back to the inbox entry or the change page; the target is built here, never taken from the form. */
-function afterDecision(c: Context<App>, repo: RepoRow, number: string, form: Record<string, unknown>, outcome: { done: string } | { error: string }): Response {
-  const query = 'done' in outcome ? `done=${encodeURIComponent(outcome.done)}` : `error=${encodeURIComponent(outcome.error)}`;
-  const target = form.back === 'inbox' ? `/inbox?${query}` : `${changeHref(repo.owner_login, repo.name, Number(number))}?${query}`;
-  return c.redirect(target, 303);
+function afterDecision(
+  c: Context<App>,
+  repo: RepoRow,
+  number: string,
+  form: Record<string, unknown>,
+  outcome: { done: string } | { error: string },
+  panel: 'decide' | 'escalations',
+): Response {
+  const n = Number(number);
+  if ('done' in outcome) {
+    const query = `done=${encodeURIComponent(outcome.done)}`;
+    return c.redirect(form.back === 'inbox' ? `/inbox?${query}` : `${changeHref(repo.owner_login, repo.name, n)}?${query}`, 303);
+  }
+  // A failed decision returns the reader to the form they used, with the error next to it.
+  const query = `error=${encodeURIComponent(outcome.error)}`;
+  if (form.back === 'inbox') {
+    const key = itemKey(repo.owner_login, repo.name, n);
+    return c.redirect(`/inbox?${query}&item=${encodeURIComponent(key)}#${key}`, 303);
+  }
+  return c.redirect(`${changeHref(repo.owner_login, repo.name, n)}?${query}#${panel}`, 303);
 }
 
 async function decide(c: Context<App>, toDecision: (form: Record<string, unknown>) => PageDecision | null, label: (d: PageDecision) => string): Promise<Response> {
@@ -488,14 +553,17 @@ async function decide(c: Context<App>, toDecision: (form: Record<string, unknown
   const number = c.req.param('number') ?? '';
   if (parseNumber(number) === null) return notFound(c);
   const d = toDecision(form);
-  if (!d) return afterDecision(c, w.cx.repo, number, form, { error: 'INVALID_VERDICT' });
+  const panel = c.req.param('id') ? 'escalations' : 'decide';
+  if (!d) return afterDecision(c, w.cx.repo, number, form, { error: 'INVALID_VERDICT' }, panel);
   const r = await decideFromPage(w.cx, number, d, form.note);
   if (!r.ok) {
     if (r.code === 'CHANGE_NOT_FOUND') return notFound(c);
-    return afterDecision(c, w.cx.repo, number, form, { error: r.code ?? 'FAILED' });
+    return afterDecision(c, w.cx.repo, number, form, { error: r.code ?? 'FAILED' }, panel);
   }
-  if (!r.value.decision) return afterDecision(c, w.cx.repo, number, form, { error: 'DECISION_NOT_RECORDED' });
-  return afterDecision(c, w.cx.repo, number, form, { done: label(d) });
+  // The remembered inbox count is now out of date; the next /inbox recounts.
+  await forgetInboxCount(w.actor.user.id);
+  if (!r.value.decision) return afterDecision(c, w.cx.repo, number, form, { error: 'DECISION_NOT_RECORDED' }, panel);
+  return afterDecision(c, w.cx.repo, number, form, { done: label(d) }, panel);
 }
 
 reviewPages.post('/changes/:number/review', (c) =>

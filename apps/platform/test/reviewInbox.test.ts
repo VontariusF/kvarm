@@ -259,6 +259,8 @@ describe('review inbox', () => {
     expect(r.text).toContain('1 stale');
     // The Inbox is in the app rail.
     expect(r.text).toContain('<a href="/inbox" aria-current="page">');
+    // The Inbox has its own glyph, not Fleet's.
+    expect(r.text).toMatch(/<a href="\/inbox" aria-current="page"><svg aria-hidden="true"><use href="#g-tray"\/>/);
   });
 
   it('pages with bounded limits and an opaque cursor', async () => {
@@ -328,6 +330,15 @@ describe('change page', () => {
     expect(r.text).toContain(`action="/${OWNER}/alpha/changes/1/review"`);
     expect(r.text).toContain(`action="/${OWNER}/alpha/changes/1/escalations/${ids.escalation}/resolve"`);
     expect(r.text).toMatch(/<textarea[^>]*name="note"[^>]*required/);
+    // Gate and escalation copy is page copy, not the API's error strings.
+    expect(r.text).not.toContain('open escalation(s) need a human');
+    expect(r.text).toContain('Reviewers disagree waits for a human.');
+    expect(r.text).toContain('The review policy wants 1 approving review of this head');
+    expect(r.text).toContain('One reviewer approved the head another asked to change.');
+    expect(r.text).toContain(' by Kvarm</span>');
+    expect(r.text).not.toContain('by system');
+    // The open change is the current repository tab.
+    expect(r.text).toContain('aria-current="page">Change #1</a>');
   });
 
   it('conceals private changes and hides decide forms from readers', async () => {
@@ -347,10 +358,35 @@ describe('change page', () => {
 });
 
 describe('deciding from the page', () => {
+  it('folds the inbox count into the header badge on every app page', async () => {
+    const inbox = await call('/inbox', tok.owner);
+    const n = /(\d+) CHANGES/.exec(inbox.text)?.[1];
+    expect(n).toBeDefined();
+    const badge = (text: string) => /<a class="k-needs" href="([^"]+)"[^>]*><span>Needs you<\/span><b>([^<]+)<\/b>/.exec(text);
+    expect(badge(inbox.text)?.slice(1)).toEqual(['/inbox', n]);
+    // Another app page reads the remembered count back, with no inbox query of its own.
+    const change = await call(`/${OWNER}/beta/changes/1`, tok.owner);
+    expect(badge(change.text)?.slice(1)).toEqual(['/inbox', n]);
+  });
+
+  it('returns a failed inbox decision to its item, panel open, error beside it', async () => {
+    const r = await call(`/${OWNER}/alpha/changes/2/review`, tok.owner, form({ verdict: 'approve', headSha: head, note: '', back: 'inbox' }));
+    const key = `ch/${OWNER}/alpha/2`;
+    expect(r.location).toBe(`/inbox?error=NOTE_REQUIRED&item=${encodeURIComponent(key)}#${key}`);
+    const page = await call(r.location!, tok.owner);
+    const at = page.text.indexOf(`id="${key}"`);
+    expect(at).toBeGreaterThan(0);
+    const item = page.text.slice(at, page.text.indexOf('</article>', at));
+    expect(item).toContain('<details class="k-decide" open>');
+    expect(item).toMatch(/role="alert">Add a note/);
+    // Shown once, next to the item, not again at the top of the page.
+    expect(page.text.split('role="alert"').length).toBe(2);
+  });
+
   it('requires a note and writes nothing without one', async () => {
     const r = await call(`/${OWNER}/alpha/changes/2/review`, tok.owner, form({ verdict: 'approve', headSha: head, note: '   ', back: 'change' }));
     expect(r.status).toBe(303);
-    expect(r.location).toBe(`/${OWNER}/alpha/changes/2?error=NOTE_REQUIRED`);
+    expect(r.location).toBe(`/${OWNER}/alpha/changes/2?error=NOTE_REQUIRED#decide`);
     const n = await env.DB.prepare('SELECT COUNT(*) AS n FROM change_reviews WHERE change_set_id = ?').bind(changeIds.waiting).first<{ n: number }>();
     expect(n?.n).toBe(0);
   });
@@ -363,6 +399,9 @@ describe('deciding from the page', () => {
     expect(review).toEqual({ verdict: 'approve', body: 'retry budget reads right', head_sha: head });
     const decision = await env.DB.prepare("SELECT chosen_candidate, reason, actor FROM agent_decisions WHERE repo_id = ? AND task_id = 'change:2'").bind(repoIds.alpha).first<Record<string, string>>();
     expect(decision).toEqual({ chosen_candidate: `approve@${head}`, reason: 'retry budget reads right', actor: OWNER });
+    // A decision drops the remembered inbox count: the badge stops claiming stale work.
+    const elsewhere = await call(`/${OWNER}/beta/changes/1`, tok.owner);
+    expect(elsewhere.text).toContain('<a class="k-needs" href="/fleet#approvals"');
     // The approval met the policy: the change left the inbox, and the decision shows on its page.
     expect((await call('/inbox', tok.owner)).text).not.toContain('Add retry budget');
     const page = await call(`/${OWNER}/alpha/changes/2`, tok.owner);
@@ -391,7 +430,7 @@ describe('deciding from the page', () => {
 
   it('refuses a review of a head that moved', async () => {
     const r = await call(`/${OWNER}/alpha/changes/1/review`, tok.owner, form({ verdict: 'request-changes', headSha: OLD_HEAD, note: 'stale page', back: 'change' }));
-    expect(r.location).toBe(`/${OWNER}/alpha/changes/1?error=HEAD_MOVED`);
+    expect(r.location).toBe(`/${OWNER}/alpha/changes/1?error=HEAD_MOVED#decide`);
   });
 
   it('resolves an escalation through the review service and records the decision', async () => {
@@ -407,7 +446,7 @@ describe('deciding from the page', () => {
     const decision = await env.DB.prepare("SELECT chosen_candidate FROM agent_decisions WHERE repo_id = ? AND task_id = 'change:1'").bind(repoIds.alpha).first<{ chosen_candidate: string }>();
     expect(decision?.chosen_candidate).toBe('resolve:reviewer-disagreement');
     const again = await call(`/${OWNER}/alpha/changes/1/escalations/${ids.escalation}/resolve`, tok.owner, form({ resolution: 'resolve', note: 'twice', back: 'change' }));
-    expect(again.location).toBe(`/${OWNER}/alpha/changes/1?error=ESCALATION_RESOLVED`);
+    expect(again.location).toBe(`/${OWNER}/alpha/changes/1?error=ESCALATION_RESOLVED#escalations`);
   });
 
   it('answers 404 to callers without write access', async () => {

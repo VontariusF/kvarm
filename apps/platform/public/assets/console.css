@@ -266,7 +266,10 @@ body.k-app .tag-await { border-color: var(--steel); color: var(--silver); }
 body.k-app .tag-stale { border-style: dashed; border-color: var(--heat-4); color: var(--heat-4); }
 body.k-app .table tr.k-row-stale td, body.k-app .table tr.k-row-stale td b { color: var(--steel); }
 body.k-app .k-cell-sha code { white-space: nowrap; overflow-wrap: normal; }
-body.k-app .k-cell-note { max-width: 320px; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* The reviewer's note is the column people read: it keeps room, and the family cell wraps instead. */
+body.k-app .k-cell-family { max-width: 150px; }
+body.k-app .k-cell-family small { white-space: normal; }
+body.k-app .k-cell-note { min-width: 220px; max-width: 320px; white-space: pre-wrap; overflow-wrap: anywhere; }
 body.k-app .k-decide > summary { width: max-content; list-style: none; }
 body.k-app .k-decide > summary::-webkit-details-marker { display: none; }
 body.k-app .k-decide[open] > summary { border-color: var(--bone); color: var(--bone); }

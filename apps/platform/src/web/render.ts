@@ -6,6 +6,7 @@
 
 import { escapeHtml, html, raw } from '@kvarm/ui';
 import { siteName } from '../config';
+import { cachedInboxCount, type InboxCount } from '../services/inboxCount';
 
 const CRITICAL_CSS = raw(`
 :root{--bg:#0d1117;--bg-raised:#161b22;--bg-inset:#010409;--border:#30363d;--fg:#e6edf3;--fg-muted:#9198a1;--accent:#3fb950;--danger:#f85149;--link:#58a6ff;--radius:6px;--mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace}
@@ -110,7 +111,10 @@ ${body}
 
 export interface AppLayoutOptions extends PageOptions {
   userId?: string | null;
+  /** Pending sandbox approvals; the badge adds the review inbox count. */
   needsYouCount?: number;
+  /** The review inbox count, when the page just computed it (/inbox); otherwise the remembered one is read. */
+  inboxCount?: InboxCount | null;
   runningCount?: number;
   repos?: Array<{ ownerLogin: string; name: string }>;
   active?: 'home' | 'inbox' | 'fleet' | 'tokens';
@@ -134,6 +138,12 @@ export async function appLayout(env: Env, opts: AppLayoutOptions, body: string):
     if (opts.runningCount === undefined) runningCount = Number(counts?.running ?? 0);
     if (opts.needsYouCount === undefined) needsYouCount = Number(counts?.approvals ?? 0);
   }
+  // Changes waiting for review join sandbox approvals: both need this human (services/inboxCount.ts).
+  const inbox = opts.inboxCount !== undefined ? opts.inboxCount : opts.userId ? await cachedInboxCount(opts.userId) : null;
+  const inboxWaiting = inbox?.count ?? 0;
+  const badge = `${needsYouCount + inboxWaiting}${inbox?.more ? '+' : ''}`;
+  const badgeHref = inboxWaiting > 0 ? '/inbox' : '/fleet#approvals';
+  const badgeTitle = `${inboxWaiting}${inbox?.more ? '+' : ''} change(s) to review · ${needsYouCount} sandbox approval(s)`;
   const repos = opts.repos ?? [];
   const repoLinks = repos
     .map(
@@ -165,6 +175,7 @@ export async function appLayout(env: Env, opts: AppLayoutOptions, body: string):
   <symbol id="mark" viewBox="0 0 48 48"><path fill="currentColor" d="M5 4h9v40H5zM28 18.5 42.5 4H48v5.5L33.5 24 48 38.5V44h-5.5L28 29.5 33.5 24z"/><path d="M23 17.5 29.5 24 23 30.5 16.5 24z" style="fill:var(--node,var(--signal))"/></symbol>
   <symbol id="g-node" viewBox="0 0 5 5"><path fill="currentColor" d="M1 0h3v1H1zM0 1h1v3H0zM4 1h1v3H4zM1 4h3v1H1zM2 2h1v1H2z"/></symbol>
   <symbol id="g-x" viewBox="0 0 5 5"><path fill="currentColor" d="M0 0h1v1H0zM4 0h1v1H4zM1 1h1v1H1zM3 1h1v1H3zM2 2h1v1H2zM1 3h1v1H1zM3 3h1v1H3zM0 4h1v1H0zM4 4h1v1H4z"/></symbol>
+  <symbol id="g-tray" viewBox="0 0 5 5"><path fill="currentColor" d="M1 0h3v1H1zM0 1h1v4H0zM4 1h1v4H4zM1 2h1v1H1zM3 2h1v1H3zM1 4h3v1H1z"/></symbol>
   <symbol id="g-reticle" viewBox="0 0 24 24"><g fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10.5"/><path d="M12 0v4M12 20v4M0 12h4M20 12h4M12 10v4M10 12h4"/></g></symbol>
 </svg>
 <header class="k-top">
@@ -173,7 +184,7 @@ export async function appLayout(env: Env, opts: AppLayoutOptions, body: string):
     <div class="k-ws"><i>${initial}</i><span>${login || 'Account'}</span></div>
   </div>
   <div class="k-right">
-    <a class="k-needs" href="/fleet#approvals"><span>Needs you</span><b>${needsYouCount}</b></a>
+    <a class="k-needs" href="${raw(badgeHref)}" title="${badgeTitle}"><span>Needs you</span><b>${badge}</b></a>
     <div class="mode" role="group" aria-label="Show this app for">
       <button type="button" data-mode-set="human" aria-pressed="true"><svg aria-hidden="true"><use href="#g-node"/></svg>Human</button>
       <button type="button" data-mode-set="agent" aria-pressed="false"><svg aria-hidden="true"><use href="#g-x"/></svg>Agent</button>
@@ -186,7 +197,7 @@ export async function appLayout(env: Env, opts: AppLayoutOptions, body: string):
   <aside class="k-rail" aria-label="App">
     <nav>
       <a href="/" ${raw(opts.active === 'home' ? 'aria-current="page"' : '')}><svg aria-hidden="true"><use href="#g-reticle"/></svg>Home</a>
-      <a href="/inbox" ${raw(opts.active === 'inbox' ? 'aria-current="page"' : '')}><svg aria-hidden="true"><use href="#g-node"/></svg>Inbox</a>
+      <a href="/inbox" ${raw(opts.active === 'inbox' ? 'aria-current="page"' : '')}><svg aria-hidden="true"><use href="#g-tray"/></svg>Inbox</a>
       <a href="/fleet" ${raw(opts.active === 'fleet' ? 'aria-current="page"' : '')}><svg aria-hidden="true"><use href="#g-node"/></svg>Fleet<span class="n">${runningCount}</span></a>
       <a href="/settings/tokens" ${raw(opts.active === 'tokens' ? 'aria-current="page"' : '')}><svg aria-hidden="true"><use href="#g-x"/></svg>Tokens &amp; agents</a>
     </nav>
