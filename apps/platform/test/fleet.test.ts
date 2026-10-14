@@ -598,7 +598,7 @@ describe('fleet pages: session CSRF (architecture §11.1)', () => {
       const id = await seedApproval('pending');
       const res = await post(`/fleet/approvals/${id}`, 'decision=approve', payload.csrf);
       expect(res.status).toBe(404);
-      expect(res.text).toContain('Reload the page');
+      expect(res.text).toContain('Open the fleet page again');
       expect(await row(id)).toMatchObject({ status: 'pending' });
     });
 
